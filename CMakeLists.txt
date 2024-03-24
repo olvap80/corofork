@@ -13,9 +13,11 @@ message("Generated with config types: ${CMAKE_CONFIGURATION_TYPES}")
 set(CMAKE_CXX_STANDARD 20)
 
 if(MSVC)
-    add_link_options("/DEBUG:FULL")
+    # Remember _HAS_STATIC_RTTI=0 shall also do /GR-
+    # add_link_options("/DEBUG:FULL")
 endif()
 
 # While in VSCode click target in status bar to select the one to run
 add_executable(corofork_all_demo corofork_all_demo.cpp)
 add_executable(corofork_thread_demo corofork_thread_demo.cpp)
+add_executable(corofork_multimpe_threads_demo corofork_multimpe_threads_demo.cpp)

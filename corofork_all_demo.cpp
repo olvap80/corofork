@@ -7,6 +7,10 @@
 
 
 int main(){
+    //for(int i = 0; i < 10; ++i){
+    //std::cout<<"ITERATION:"<<i<<std::endl;
+
+    
     std::cout<<"Testing coroutines, main enter\n"<<std::endl;
 
     corofork(){
@@ -740,51 +744,79 @@ int main(){
         <<std::endl;
     };
 
-#if 0
+#if 1
 
-        /*{
-            auto waiter = invert_function_subscription([](std::function<void()> f){
-                ... //manual setup for f
+    /**
+    Q:  When setup happens?
+    A:  buffered can setup immediately, callbacks will accumulate;
+        unbuffered also can happen immediately, callbacks will delay (DRAWBACK)
+    
+    Q:  What if source provides other call while previous is not completed?
+    A:  buffered shall place them it into buffer;
+        unbuffered shall cause the source to stall (DRAWBACK)
 
-                //returns "unsubscriber"
-                return [=]{
-                    ... //(manual) teardown
-                }
-            });
+    Q:  What about "awaiting for something else"
+    A:  buffered can await, callbacks will accumulate;
+        unbuffered will cause source to stall 
+        while awaiting for "something else"
+        (probably for indefinite time, DRAWBACK)
 
-            //hmm... co_await for "something else" here
-            //means calls to subscription shall be queued?
+    Q:  How callback returns a value?
+    A:  buffered can only return immediately, 
+        since every call needs immediate answer (DRAWBACK);
+        unbuffered can provide result "in time" with function
+        (but likely nobody will use that feature, just abandon it)
 
-            for(int i = 0; i < 10; ++i){
-                co_await waiter();
+    The final decision is to make calls to subscription to be accumulated,
+    await on subscription shall extract item from the buffer
+    
+    
+    {
+        auto waiter = invert_subscription([](std::function<void()> f){
+            ... //manual setup for f
+
+            //returns "unsubscriber"
+            return [=]{
+                ... //(manual) teardown
             }
+        });
 
-            //waiter goes out of scope, subscription disappears
+        //hmm... co_await for "something else" here
+        //means calls to subscription shall be queued?
+
+        for(int i = 0; i < 10; ++i){
+            co_await waiter; //
         }
-        
-        //actual return to issuer happens 
-        //only when we co_await on "something else"
-        //but here we are unsubscribed for sure
 
-        co_await ...
-        
-        */
+        //waiter goes out of scope, subscription disappears, generated API shall be deallocated
+    }
+    
+    //actual return to issuer happens 
+    //only when we co_await on "something else"
+    //but here we are unsubscribed for sure
 
-        /*{
-            auto file = deferred{
-                auto file = fopen(...)
-                co_yield file;
-                fclose(file)
-            }
+    co_await ...
+    
+    */
 
-            //work *file
+    /*{
+        auto file = deferred{
+            auto file = fopen(...)
+            co_yield file;
+            fclose(file)
+        }
 
-            //file goes out of scope and cleanup
-            //seems deferpp works better for this  
-        }*/
+        //work *file
+
+        //file goes out of scope and cleanup
+        //seems deferpp works better for this  
+    }*/
        
 #endif
 
     std::cout<<"\nTesting coroutines, main leave"<<std::endl;
+
+    //}
+    
     return 0;
 }

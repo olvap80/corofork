@@ -71,7 +71,9 @@
         "xtree": "cpp",
         "condition_variable": "cpp",
         "future": "cpp",
-        "resumable": "cpp"
+        "resumable": "cpp",
+        "deque": "cpp",
+        "queue": "cpp"
     },
     "cSpell.words": [
         "corofork"

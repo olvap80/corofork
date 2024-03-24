@@ -9,7 +9,7 @@ Sample usage (see also more concrete samples below):
 
  @code
     // Some code
-    corofork(=){ //= means "new coroutine captures by value" 
+    corofork(=){ //here = means "new coroutine captures by value" 
         // Some code that still executes in the same context
 
         await AnyAwaitableThing; //some await operation
@@ -78,6 +78,7 @@ but fully C++ standard compliant
  @code
     corofork(){
         co_await invert_function([](std::function<void()> resumer){
+            // Note: resumer will continue execution of the coroutine in thread
             std::thread(resumer).detach();
         });
         //from now coroutine executes in thread
@@ -85,7 +86,7 @@ but fully C++ standard compliant
         ... //doing some in parallel with main
     };
 
-    ... //continue execution
+    ... //continue execution independently of corofork content above))
  @endcode
 
 RETURN sample
@@ -141,15 +142,20 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <optional>
 //internally tracks lifetime automatically 
 #include <memory>
-//std::move and friends))
+//std::move, std::swap and friends))
 #include <utility>
 //allow allocation for pregenerated trampolines from different threads
 #include <mutex>
 //runtime_error throws when trampoline allocation fails
 #include <stdexcept>
 //placement new is used for placing lambda to trampoline
-#include <new> 
-
+#include <new>
+//for std::nullptr_t
+#include <cstddef>
+//Used by invert_subscription to accumulate events (calls) happened so far
+#include <queue>
+//Used by invert_subscription_holder
+#include <condition_variable>
 
 
 
@@ -162,21 +168,21 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  * The way how variables are captured is determined by the macro parameters
  * one can provide =, &, or named captures as well */
 #define corofork(...) \
-    CoroFork_SupportNamespace::tagClassForLambda ->* \
+    CoroFork_detail::tagClassForLambda ->* \
     /* Note: lambda is not called below, operator->* does the stuff */ \
-    [__VA_ARGS__]()->CoroFork_SupportNamespace::CoroFork /* Lambda body follows here */
+    [__VA_ARGS__]()->CoroFork_detail::CoroFork /* Lambda body follows here */
 
 
 
 //______________________________________________________________________________
 // Some "must have" internal stuff before declaring API (just skip that!!!))
 
-namespace CoroFork_SupportNamespace{
+namespace CoroFork_detail{
 
     /// Meta function to extract types from LambdaType::operator()
     /** This is "pre declaration", implementation is in details below */
     template<class MethodSignature>
-    struct ExtractFromOperator;
+    struct FromOperator;
 
 
     //__________________________________________________________________________
@@ -184,22 +190,22 @@ namespace CoroFork_SupportNamespace{
 
     /// General meta function to extract signatures for generated API
     template<class LambdaType>
-    using ExtractFromLambda = ExtractFromOperator<decltype(&LambdaType::operator())>;
+    using ExtractFromLambda = FromOperator<decltype(&LambdaType::operator())>;
 
 
     //__________________________________________________________________________
     // Forward declare awaitables
 
     template<class Decorator, class CoResult, class SetupLambdaType>
-    class AwaitableWithSimpleCallback;
+    class AwaitableSimpleCB;
 
     template<class Decorator, class CoResult,
         class SetupLambdaType, class GeneratedCallbackResultType>
-    class AwaitableGeneratedCallbackReturnsValue;
+    class AwaitableGeneratedCBReturnsValue;
 
     template<class Decorator, class CoResult,
         class SetupLambdaType, class CallbackToCallFromGeneratedCallbackType>
-    class AwaitableGeneratedCallbackReturnsResultOfCall;
+    class AwaitableGeneratedCBReturnsResultOfCall;
 
     //__________________________________________________________________________
     // Helpers for callback_from_lambda
@@ -214,18 +220,19 @@ namespace CoroFork_SupportNamespace{
         ConvertSignature<decltype(&LambdaType::operator())>::SimpleSignature;
 
     //__________________________________________________________________________
-    // Utility API
+    // Utility stuff
 
     /// Default customization for generated callback (no custom wrapping)
-    struct NoDecorating{
-        /// Returns argument as is
-        template<class WrappedCallback>
-        static constexpr std::remove_reference_t<WrappedCallback>&&
-        decorate(WrappedCallback&& cb) noexcept{
-            return std::move(cb);
-        }
-    };
-} //namespace CoroFork_SupportNamespace
+    struct TheSame;
+
+    /// Customization that turns std::function to "plain C" callback
+    template<
+        std::size_t maxCallbacksCount,
+        class AdditionalOptionalTag
+    >
+    class ToPlainC;
+
+} //namespace CoroFork_detail
 
 
 //______________________________________________________________________________
@@ -234,7 +241,9 @@ namespace CoroFork_SupportNamespace{
 ///Turn lambda to function pointer by storing lambda in a block pool
 /** Create "single shot" trampoline by default
 (trampoline deallocates automatically after first call, 
- thus freeing one item reservedCount)
+ thus freeing one item in reservedCount,
+ NOTE: never issued callback will never free!
+       use scoped_callback to be able to release without call)
 For usage sample see explanations at beginning of the file.
 NOTE: AdditionalOptionalTag can be used for "nonunique" types, 
       when "something else" than lambda is passed to CallbackFrom
@@ -251,7 +260,7 @@ template<
     class UniqueLambdaType ///< Type for actual callable to be wrapped 
 >
 auto callback_from_lambda(UniqueLambdaType&& lambda) ->
-    CoroFork_SupportNamespace::SimpleSignatureFromLambda<
+    CoroFork_detail::SimpleSignatureFromLambda<
         UniqueLambdaType
     >*;
 
@@ -272,10 +281,10 @@ public:
     (this means resource limited by reservedCount can be reused again,
      and this also means calling lambda must make sure that the old caller 
      will not issue the same trampoline any more) */
-    void Dispose();
+    void dispose();
 
     ///Test corresponding trampoline is disposed (freed)
-    bool IsDisposed() const;
+    bool is_disposed() const;
 
 protected:
     /// Created by corresponding apply
@@ -286,32 +295,60 @@ private:
     bool isDisposed = false;
 };
 
-//______________________________________________________________________________
-// Some more "must have" internal stuff before declaring API (just skip that!!!))
 
-namespace CoroFork_SupportNamespace{
-    //__________________________________________________________________________
-    // Utility API (continues)
+/// RAII to hold callback allocation as long as needed
+/** Use scoped_callback below as convenience API */
+template<
+    unsigned reservedCount, ///< how many callbacks coexist simultaneously for
+                            ///< that (AdditionalOptionalTag, UniqueLambdaType)
+                            ///< unique combination 
+    class AdditionalOptionalTag, ///< tweak for case UniqueLambdaType
+                                 ///< is not unique
+    class UniqueLambdaType ///< Type for actual callable to be wrapped 
+>
+class scoped_callback_holder{
+public:
+    /// Corresponding simple API signature
+    using Signature = CoroFork_detail::SimpleSignatureFromLambda<UniqueLambdaType>;
 
-    /// Customization that turns std::function to "plain C" callback
-    template<
-        std::size_t maxCallbacksCount,
-        class AdditionalOptionalTag
-    >
-    struct ConvertToPlainC{
-        /// Return argument wrapped into "plain C" callback
-        template<class WrappedCallback>
-        static auto decorate(WrappedCallback&& cb) noexcept{
+    /// Create instance from lambda
+    scoped_callback_holder(UniqueLambdaType&& lambda);
 
-            return callback_from_lambda<
-                maxCallbacksCount,
-                ConvertToPlainC<maxCallbacksCount, AdditionalOptionalTag> //ensure unique type
-            >(
-                std::move(cb)
-            );
-        }
-    };
-} //namespace CoroFork_SupportNamespace
+    /// Cleanup the stuff once instance goes out of scope
+    ~scoped_callback_holder();
+
+    /// Assign callback after scoped_callback_holder was created
+    scoped_callback_holder& operator=(UniqueLambdaType&& lambda);
+
+    // can move, but cannot copy
+    scoped_callback_holder(const scoped_callback_holder&&);
+    scoped_callback_holder& operator=(const scoped_callback_holder&&);
+    scoped_callback_holder(const scoped_callback_holder&) = delete;
+    scoped_callback_holder& operator=(const scoped_callback_holder&) = delete;
+
+
+    /// Obtain pointer. Do not use that after scoped_callback_holder destructs.
+    Signature* Callback() const;
+
+private:
+    /// "Type erased" info for deallocation
+    void* owningBlock = nullptr;
+};
+
+/// Generate callback around lambda, that exists as long as scope  
+template<
+    unsigned reservedCount, ///< how many callbacks coexist simultaneously for
+                            ///< that (AdditionalOptionalTag, UniqueLambdaType)
+                            ///< unique combination 
+    class AdditionalOptionalTag = void, ///< tweak for case UniqueLambdaType
+                                        ///< is not unique
+    class UniqueLambdaType ///< Type for actual callable to be wrapped 
+>
+auto scoped_callback(UniqueLambdaType&& lambda) ->
+    scoped_callback_holder<
+        reservedCount, AdditionalOptionalTag, UniqueLambdaType
+    >;
+
 
 //______________________________________________________________________________
 // Describe kinds of lambda used for setup (it is better to look into samples))
@@ -321,7 +358,7 @@ namespace CoroFork_SupportNamespace{
 template<class SetupLambdaType>
 concept CoroForkLambdaToSetupFunction = requires(
     SetupLambdaType setupLambda,
-    typename CoroFork_SupportNamespace::ExtractFromLambda<
+    typename CoroFork_detail::ExtractFromLambda<
         SetupLambdaType
     >::FunctionType generatedFunction
 ){
@@ -336,7 +373,7 @@ concept CoroForkLambdaToSetupFunction = requires(
 template<class SetupLambdaType>
 concept CoroForkLambdaToSetupCallback = requires(
     SetupLambdaType setupLambda,
-    typename CoroFork_SupportNamespace::ExtractFromLambda<
+    typename CoroFork_detail::ExtractFromLambda<
         SetupLambdaType
     >::RawPointerCallbackType generatedRawPointerCallback
 ){
@@ -364,19 +401,20 @@ concept CoroForkLambdaToSetupCallback = requires(
 
 
 /// Turn std::function callback based API into coroutine based
-/** Provided lambda shall contain desired callback with corresponding signature
- * as a parameter. Such callback can be passed to asynchronous API to be called
- * later by "something else". Once called that generated function callback 
- * will resume the coroutine awaiting for the result of invert_function,
+/** Provided lambda shall receive desired callback with corresponding signature
+ * as a parameter. Such callback can be passed to asynchronous API
+ * to be called later by "something else" single time. 
+ * Once that generated function callback is called it will 
+ * resume the coroutine awaiting for the result of invert_function,
  * and callback arguments will go to caller.   
  * See samples above for illustration */
 template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
 auto invert_function(
     const LambdaToSetupFunction& setupFunction ///< receives generated callback
 ){
-    return CoroFork_SupportNamespace::AwaitableWithSimpleCallback<
-        CoroFork_SupportNamespace::NoDecorating,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupFunction>::CoResultType,
+    return CoroFork_detail::AwaitableSimpleCB<
+        CoroFork_detail::TheSame,
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::CoResultType,
         LambdaToSetupFunction
     >(setupFunction);
 }
@@ -396,18 +434,18 @@ requires
             ResultForCallbackFunctionAsValue
         >,
         std::remove_cvref_t<
-            typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+            typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
         >
     >
 auto invert_function(
     const LambdaToSetupFunction& setupFunction, ///< Your setup
     ResultForCallbackFunctionAsValue&& resultForCallbackFunction
 ){
-    return CoroFork_SupportNamespace::AwaitableGeneratedCallbackReturnsValue<
-        CoroFork_SupportNamespace::NoDecorating,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupFunction>::CoResultType,
+    return CoroFork_detail::AwaitableGeneratedCBReturnsValue<
+        CoroFork_detail::TheSame,
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::CoResultType,
         LambdaToSetupFunction,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
     >(
         setupFunction, 
         std::forward<ResultForCallbackFunctionAsValue>(resultForCallbackFunction)
@@ -422,7 +460,7 @@ template<
 requires    
     std::same_as<
         std::remove_cvref_t<
-            typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+            typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
         >,
         std::remove_cvref_t<
             std::invoke_result_t< std::remove_cvref_t<FunctionToObtainResult> >
@@ -432,9 +470,9 @@ auto invert_function(
     const LambdaToSetupFunction& setupFunction,
     FunctionToObtainResult&& functionToObtainResultForCallbackFunction
 ){
-    return CoroFork_SupportNamespace::AwaitableGeneratedCallbackReturnsResultOfCall<
-        CoroFork_SupportNamespace::NoDecorating,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupFunction>::CoResultType,
+    return CoroFork_detail::AwaitableGeneratedCBReturnsResultOfCall<
+        CoroFork_detail::TheSame,
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::CoResultType,
         LambdaToSetupFunction,
         FunctionToObtainResult
     >(setupFunction, functionToObtainResultForCallbackFunction);
@@ -453,11 +491,11 @@ template<
 auto invert_callback(
     const LambdaToSetupCallback& setupCallback
 ){
-    return CoroFork_SupportNamespace::AwaitableWithSimpleCallback<
-        CoroFork_SupportNamespace::ConvertToPlainC<
+    return CoroFork_detail::AwaitableSimpleCB<
+        CoroFork_detail::ToPlainC<
             maxCallbacksCount, LambdaToSetupCallback
         >,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<
+        typename CoroFork_detail::ExtractFromLambda<
             LambdaToSetupCallback
         >::CoResultType,
         LambdaToSetupCallback
@@ -480,20 +518,20 @@ requires
             ResultForCallbackFunctionAsValue
         >,
         std::remove_cvref_t<
-            typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupCallback>::FunctionResultType
+            typename CoroFork_detail::ExtractFromLambda<LambdaToSetupCallback>::FunctionResultType
         >
     >
 auto invert_callback(
     const LambdaToSetupCallback& setupCallback,
     ResultForCallbackFunctionAsValue&& resultForCallback
 ){
-    return CoroFork_SupportNamespace::AwaitableGeneratedCallbackReturnsValue<
-        CoroFork_SupportNamespace::ConvertToPlainC<
+    return CoroFork_detail::AwaitableGeneratedCBReturnsValue<
+        CoroFork_detail::ToPlainC<
             maxCallbacksCount, LambdaToSetupCallback
         >,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupCallback>::CoResultType,
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupCallback>::CoResultType,
         LambdaToSetupCallback,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupCallback>::FunctionResultType
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupCallback>::FunctionResultType
     >(
         setupCallback, 
         std::forward<ResultForCallbackFunctionAsValue>(resultForCallback)
@@ -509,7 +547,7 @@ template<
 requires    
     std::same_as<
         std::remove_cvref_t<
-            typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupCallback>::FunctionResultType
+            typename CoroFork_detail::ExtractFromLambda<LambdaToSetupCallback>::FunctionResultType
         >,
         std::remove_cvref_t<
             std::invoke_result_t< std::remove_cvref_t<FunctionToObtainResult> >
@@ -519,15 +557,144 @@ auto invert_callback(
     const LambdaToSetupCallback& setupCallback,
     FunctionToObtainResult&& functionToObtainResultForCallback
 ){
-    return CoroFork_SupportNamespace::AwaitableGeneratedCallbackReturnsResultOfCall<
-        CoroFork_SupportNamespace::ConvertToPlainC<
+    return CoroFork_detail::AwaitableGeneratedCBReturnsResultOfCall<
+        CoroFork_detail::ToPlainC<
             maxCallbacksCount, LambdaToSetupCallback
         >,
-        typename CoroFork_SupportNamespace::ExtractFromLambda<LambdaToSetupCallback>::CoResultType,
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupCallback>::CoResultType,
         LambdaToSetupCallback,
         FunctionToObtainResult
     >(setupCallback, functionToObtainResultForCallback);
 }
+
+
+//______________________________________________________________________________
+// Turning subscription to awaitable for function
+
+
+/// On subscription as long as instance exists
+template<class AwaitedType>
+class invert_subscription_holder{
+public:
+    /// Setup simple generated subscription that returns nothing
+    /** See corresponding invert_subscription below */
+    template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
+    invert_subscription_holder(
+        const LambdaToSetupFunction& setupFunction ///< receives generated callback
+    ): finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+                        ::SubscribeSimpleCB(this, setupFunction) ) {}
+
+    /// Setup simple generated subscription that returns value
+    /** See corresponding invert_subscription below */
+    template<
+        CoroForkLambdaToSetupFunction LambdaToSetupFunction,
+        class ResultForCallbackFunctionAsValue
+    >
+    requires    
+        std::convertible_to<
+            std::remove_cvref_t<
+                ResultForCallbackFunctionAsValue
+            >,
+            std::remove_cvref_t<
+                typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+            >
+        >
+    invert_subscription_holder(
+        const LambdaToSetupFunction& setupFunction, ///< Your setup
+        ResultForCallbackFunctionAsValue&& resultForCallbackFunction
+    ): finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+        ::SubscribeCBReturnsValue(this, setupFunction, resultForCallbackFunction) ) {}
+
+
+    /// Number of items accumulated by subscription so far
+    std::size_t count() const;
+
+    // exists only in one place (but takes advantage of RVO)
+    invert_subscription_holder(const invert_subscription_holder&) = delete;
+    invert_subscription_holder& operator=(const invert_subscription_holder&) = delete;
+
+
+    /// Awaitable being used 
+    class awaitable{
+    public:
+        // can move, but cannot copy
+        awaitable(const awaitable&&);
+        awaitable& operator=(const awaitable&&);
+        awaitable(const awaitable&) = delete;
+        awaitable& operator=(const awaitable&) = delete;
+
+
+    private:
+        friend class invert_subscription_holder;
+        ///
+        awaitable(invert_subscription_holder* awaitFrom);
+    };
+
+    /// Allow the same invert_subscription_holder to be awaited multiple times
+    awaitable operator co_await(){
+        return awaitable(this);
+    }
+private:
+    ///
+    std::function< void() > finalCleanup;
+
+    /// Events that are available so far
+    std::queue<AwaitedType> eventsQueue;
+
+    /// Protect operations with eventsQueue
+    /** Subscription data may arrive from different threads */
+    std::mutex protectEventsQueue;
+    /// TODO do we need this?
+    std::condition_variable onceItemAdded;
+};
+
+/// Turn std::function subscription based API into coroutine based
+/** Provided lambda shall receive desired callback with corresponding signature
+ * as a parameter. Such callback can be passed to asynchronous subscription API
+ * to be called later (likely multiple times) by "something else".
+ * Each time once called that generated function callback 
+ * will resume the coroutine awaiting for invert_subscription_holder
+ * being created by the invert_subscription call,
+ * and callback arguments will go to caller.   
+ * See samples above for illustration */
+template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
+auto invert_subscription(
+    const LambdaToSetupFunction& setupFunction ///< receives generated callback
+){
+    //takes advantage of RVO here
+    invert_subscription_holder<
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::CoResultType
+    >(setupFunction);
+}
+
+/// Same as above but now there is a return value of generated callback
+template<
+    CoroForkLambdaToSetupFunction LambdaToSetupFunction,
+    class ResultForCallbackFunctionAsValue
+>
+requires    
+    std::convertible_to<
+        std::remove_cvref_t<
+            ResultForCallbackFunctionAsValue
+        >,
+        std::remove_cvref_t<
+            typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+        >
+    >
+auto invert_subscription(
+    const LambdaToSetupFunction& setupFunction, ///< Your setup
+    ResultForCallbackFunctionAsValue&& resultForCallbackFunction
+){
+    //takes advantage of RVO here
+    invert_subscription_holder<
+        typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::CoResultType
+    >(
+        setupFunction, 
+        std::forward<ResultForCallbackFunctionAsValue>(resultForCallbackFunction)
+    );
+}
+
+
 
 
 //______________________________________________________________________________
@@ -538,7 +705,8 @@ auto invert_callback(
 //##############################################################################
 
 
-namespace CoroFork_SupportNamespace{
+
+namespace CoroFork_detail{
 
     //__________________________________________________________________________
     // General corofork macro support
@@ -671,16 +839,14 @@ namespace CoroFork_SupportNamespace{
     // Helper to decide on result from setup lambda
 
     /// Handle case then Setup is able to obtain result before async operation
-    /** Just check result is already there and  */
+    /** Just check result is already there 
+     * and place it to expected destination (or stay suspended) */
     template<
-        class OperatorResult, //note here OperatorResult is not void for sure
-                              //as void is handled by specializations below,
-                              //without involving ProcessResult
         class CoResultType,
         class AwaitableToPlaceResult
     >
     bool ProcessResult(
-        OperatorResult operatorResult,
+        std::optional<CoResultType>&& operatorResult,
         AwaitableToPlaceResult* self
     ){
         if( operatorResult ){
@@ -699,7 +865,7 @@ namespace CoroFork_SupportNamespace{
 
     //version without arguments at all, but lambda can complete synchronously
     template<class OperatorResult, class LambdaType>
-    struct ExtractFromOperator<
+    struct FromOperator<
         OperatorResult(LambdaType::*)( std::function<void()> )
     >{
         using Signature = void();
@@ -707,32 +873,49 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = void;
         using FunctionResultType = void;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function
-            template<class AwaitableToPlaceResult>
-            static bool SetupWithSimpleCallback(
-                AwaitableToPlaceResult* /*self unused but keep signature*/,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda
-            ){
-                static_assert(
-                    std::same_as<OperatorResult, bool>,
-                    "Such setup lambda shall return void or bool\n"
-                    "true means operation completed synchronously immediately (and callback was not scheduled),\n"
-                    "false means one will await for callback (callback was scheduled)"
-                );
-                // inverts result
-                return !setupLambda(
-                    Decorator::decorate(handle)
-                );
-            }
-        };
+
+        ///Invoke setup with resuming function
+        template<class AwaitableToPlaceResult>
+        static bool SetupSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            static_assert(
+                std::same_as<OperatorResult, bool>,
+                "Such setup lambda shall return void or bool\n"
+                "true means operation completed synchronously immediately (and callback was not scheduled),\n"
+                "false means one will await for callback (callback was scheduled)"
+            );
+            // inverts result to resume the coroutine
+            return !setupLambda(
+                self->Decorate(handle)
+            );
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult>
+        static auto SubscribeSimpleCB(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda
+        ){
+            static_assert(
+                std::invocable<OperatorResult>,
+                "Such setup lambda shall return void or invocable\n"
+                "void means no cleanup is needed\n"
+                "invocable is a simple cleanup function to be called on scope exit"
+            );
+            // returns cleanup API
+            return setupLambda(
+                self->Decorate([=]{
+                    self->OnEventHappened();
+                })
+            );
+        }
     };
     //version without arguments at all, when lambda always starts async operation!  
     template<class LambdaType>
-    struct ExtractFromOperator<
+    struct FromOperator<
         void(LambdaType::*)( std::function<void()> )
     >{
         using Signature = void();
@@ -740,27 +923,39 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = void;
         using FunctionResultType = void;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function
-            template<class AwaitableToPlaceResult>
-            static bool SetupWithSimpleCallback(
-                AwaitableToPlaceResult* /*self unused but keep signature*/,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda
-            ){
-                setupLambda(
-                    Decorator::decorate(handle)
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
-        };
+
+        ///Invoke setup with resuming function
+        template<class AwaitableToPlaceResult>
+        static bool SetupSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            setupLambda(
+                self->Decorate(handle)
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult>
+        static auto SubscribeSimpleCB(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda
+        ){
+            setupLambda(
+                self->Decorate([=]{
+                    self->OnEventHappened();
+                })
+            );
+            // returns cleanup API that does nothing
+            return [](){};
+        }
     };
 
     //single argument version, lambda optionally can complete synchronously
     template<class OperatorResult, class LambdaType, class CallbackArg>
-    struct ExtractFromOperator<
+    struct FromOperator<
         OperatorResult(LambdaType::*)( std::function<void(CallbackArg)> )
     >{
         using Signature = void(CallbackArg);
@@ -768,39 +963,56 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = CallbackArg;
         using FunctionResultType = void;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers argument
-            template<class AwaitableToPlaceResult>
-            static bool SetupWithSimpleCallback(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda
-            ){
-                static_assert(
-                    std::same_as<OperatorResult, std::optional<CallbackArg>>,
-                    "Call to lambda shall return void of std::optional<CallbackArg>\n"
-                    "(present value means result is ready immediately)"
-                );
 
-                return ProcessResult<OperatorResult, CoResultType, AwaitableToPlaceResult>(
-                    setupLambda(
-                        Decorator::decorate(
-                            [=](CallbackArg arg){
-                                self->EmplaceCoResult(arg); //what will be returned to coroutine
-                                handle();
-                            }
-                        )
-                    ),
-                    self
-                );
-            }
-        };
+        ///Invoke setup with resuming function that remembers argument
+        template<class AwaitableToPlaceResult>
+        static bool SetupSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            static_assert(
+                std::same_as<OperatorResult, std::optional<CallbackArg>>,
+                "Call to lambda shall return void of std::optional<CallbackArg>\n"
+                "(present value means result is ready immediately)"
+            );
+
+            return ProcessResult<CoResultType, AwaitableToPlaceResult>(
+                setupLambda(
+                    self->Decorate(
+                        [=](CallbackArg arg){
+                            self->EmplaceCoResult(arg); //what will be returned to coroutine
+                            handle();
+                        }
+                    )
+                ),
+                self
+            );
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult>
+        static auto SubscribeSimpleCB(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda
+        ){
+            static_assert(
+                std::invocable<OperatorResult>,
+                "Such setup lambda shall return void or invocable\n"
+                "void means no cleanup is needed\n"
+                "invocable is a simple cleanup function to be called on scope exit"
+            );
+            // returns cleanup API
+            return setupLambda(
+                self->Decorate([=](CallbackArg arg){
+                    self->OnParametersArrived(arg); //what will be returned to coroutine
+                })
+            );
+        }
     };
     //single argument version, lambda always starts asynchronous operation
     template<class LambdaType, class CallbackArg>
-    struct ExtractFromOperator<
+    struct FromOperator<
         void(LambdaType::*)( std::function<void(CallbackArg)> )
     >{
         using Signature = void(CallbackArg);
@@ -808,32 +1020,46 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = CallbackArg;
         using FunctionResultType = void;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers argument
-            template<class AwaitableToPlaceResult>
-            static bool SetupWithSimpleCallback(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda
-            ){
-                setupLambda(
-                    Decorator::decorate(
-                        [=](CallbackArg arg){
-                            self->EmplaceCoResult(arg); //what will be returned to coroutine
-                            handle();
-                        }
-                    )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
-        };
+
+        ///Invoke setup with resuming function that remembers argument
+        template<class AwaitableToPlaceResult>
+        static bool SetupSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            setupLambda(
+                self->Decorate(
+                    [=](CallbackArg arg){
+                        self->EmplaceCoResult(arg); //what will be returned to coroutine
+                        handle();
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult>
+        static auto SubscribeSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            setupLambda(
+                self->Decorate([=](CallbackArg arg){
+                    self->OnParametersArrived(arg); //what will be returned to coroutine
+                })
+            );
+
+            // returns cleanup API that does nothing
+            return [](){};
+        }
     };
 
     //multiple argument version, lambda optionally can complete synchronously
     template<class OperatorResult, class LambdaType, class... CallbackArgs>
-    struct ExtractFromOperator<
+    struct FromOperator<
         OperatorResult(LambdaType::*)( std::function<void(CallbackArgs...)> )
     >{
         using Signature = void(CallbackArgs...);
@@ -841,39 +1067,55 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = std::tuple<CallbackArgs...>;
         using FunctionResultType = void;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers arguments
-            template<class AwaitableToPlaceResult>
-            static bool SetupWithSimpleCallback(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda
-            ){
-                static_assert(
-                    std::same_as<OperatorResult, std::optional<CoResultType>>,
-                    "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
-                    "(present value means result is ready immediately)"
-                );
 
-                return ProcessResult<OperatorResult, CoResultType, AwaitableToPlaceResult>(
-                    setupLambda(
-                        Decorator::decorate(
-                            [=](CallbackArgs... args){
-                                self->EmplaceCoResult(args...); //what will be returned to coroutine
-                                handle();
-                            }
-                        )
-                    ),
-                    self
-                );
-            }
-        };
+        ///Invoke setup with resuming function that remembers arguments
+        template<class AwaitableToPlaceResult>
+        static bool SetupSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            static_assert(
+                std::same_as<OperatorResult, std::optional<CoResultType>>,
+                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "(present value means result is ready immediately)"
+            );
+
+            return ProcessResult<CoResultType, AwaitableToPlaceResult>(
+                setupLambda(
+                    self->Decorate(
+                        [=](CallbackArgs... args){
+                            self->EmplaceCoResult(args...); //what will be returned to coroutine
+                            handle();
+                        }
+                    )
+                ),
+                self
+            );
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult>
+        static auto SubscribeSimpleCB(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda
+        ){
+            static_assert(
+                std::same_as<OperatorResult, std::optional<CoResultType>>,
+                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "(present value means result is ready immediately)"
+            );
+
+            return setupLambda(
+                self->Decorate([=](CallbackArgs... args){
+                    self->OnParametersArrived(args...); //what will be returned to coroutine
+                })
+            );
+        }
     };
     //multiple argument version, lambda always starts asynchronous operation
     template<class LambdaType, class... CallbackArgs>
-    struct ExtractFromOperator<
+    struct FromOperator<
         void(LambdaType::*)( std::function<void(CallbackArgs...)> )
     >{
         using Signature = void(CallbackArgs...);
@@ -881,27 +1123,40 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = std::tuple<CallbackArgs...>;
         using FunctionResultType = void;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers arguments
-            template<class AwaitableToPlaceResult>
-            static bool SetupWithSimpleCallback(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda
-            ){
-                setupLambda(
-                    Decorator::decorate(
-                        [=](CallbackArgs... args){
-                            self->EmplaceCoResult(args...); //what will be returned to coroutine
-                            handle();
-                        }
-                    )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
-        };
+
+        //Invoke setup with resuming function that remembers arguments
+        template<class AwaitableToPlaceResult>
+        static bool SetupSimpleCB(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda
+        ){
+            setupLambda(
+                self->Decorate(
+                    [=](CallbackArgs... args){
+                        self->EmplaceCoResult(args...); //what will be returned to coroutine
+                        handle();
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult>
+        static auto SubscribeSimpleCB(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda
+        ){
+            setupLambda(
+                self->Decorate([=](CallbackArgs... args){
+                    self->OnParametersArrived(args...); //what will be returned to coroutine
+                })
+            );
+
+            // returns cleanup API that does nothing
+            return [](){};
+        }
     };
 
     //__________________________________________________________________________
@@ -909,7 +1164,7 @@ namespace CoroFork_SupportNamespace{
 
     //version without arguments at all, but lambda can complete synchronously
     template<class OperatorResult, class LambdaType, class CallbackRes>
-    struct ExtractFromOperator<
+    struct FromOperator<
         OperatorResult(LambdaType::*)( std::function<CallbackRes()> )
     >{
         using Signature = CallbackRes();
@@ -917,138 +1172,132 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = void;
         using FunctionResultType = CallbackRes;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that returns value
-            template<class AwaitableToPlaceResult, class Value>
-            static bool SetupWithValueForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Value&& result
-            ){
-                static_assert(
-                    std::same_as<OperatorResult, bool>,
-                    "Such setup lambda shall return void or bool\n"
-                    "true means operation completed synchronously immediately (and callback was not scheduled),\n"
-                    "false means one will await for callback (callback was scheduled)"
-                );
-                // inverts result
-                return !setupLambda(
-                    Decorator::decorate(
-                        [   =,
-                            //captured copy shall be able to exist a for long time
-                            storedResult=std::remove_reference_t<Value>(
-                                std::forward<Value>(result)
-                            )
-                        ](){
-                            handle(); //resume the coroutine
-                            // storedResult is alive as long as capture exists
-                            return storedResult;
-                        }
-                    )
-                );
-            }
 
-            //Invoke setup with resuming function that calculates result
-            template<class AwaitableToPlaceResult, class Function>
-            static bool SetupWithFunctionForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Function&& resultGetter
-            ){
-                static_assert(
-                    std::same_as<OperatorResult, bool>,
-                    "Such setup lambda shall return void or bool\n"
-                    "true means operation completed synchronously immediately (and callback was not scheduled),\n"
-                    "false means one will await for callback (callback was scheduled)"
-                );
-                // inverts result
-                return !setupLambda(
-                    Decorator::decorate(
-                        [   =,
-                            //captured copy shall be able to exist a for long time
-                            calculateResult=std::remove_reference_t<Function>(
-                                std::forward<Function>(resultGetter)
-                            )
-                        ](){
-                            handle(); //resume the coroutine
-                            // calculateResult is alive as long as capture exists
-                            return calculateResult();
-                        }
-                    )
-                );
-            }
-        };
+        //Invoke setup with resuming function that returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static bool SetupCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            static_assert(
+                std::same_as<OperatorResult, bool>,
+                "Such setup lambda shall return void or bool\n"
+                "true means operation completed synchronously immediately (and callback was not scheduled),\n"
+                "false means one will await for callback (callback was scheduled)"
+            );
+            // inverts result
+            return !setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](){
+                        handle(); //resume the coroutine
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
+            );
+        }
+
+        //Invoke setup with resuming function that calculates result
+        template<class AwaitableToPlaceResult, class Function>
+        static bool SetupCBReturnsResultOfCall(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Function&& resultGetter
+        ){
+            static_assert(
+                std::same_as<OperatorResult, bool>,
+                "Such setup lambda shall return void or bool\n"
+                "true means operation completed synchronously immediately (and callback was not scheduled),\n"
+                "false means one will await for callback (callback was scheduled)"
+            );
+            // inverts result
+            return !setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        calculateResult=std::remove_reference_t<Function>(
+                            std::forward<Function>(resultGetter)
+                        )
+                    ](){
+                        handle(); //resume the coroutine
+                        // calculateResult is alive as long as capture exists
+                        return calculateResult();
+                    }
+                )
+            );
+        }
     };
     //version without arguments at all, when lambda always starts async operation!
     template<class LambdaType, class CallbackRes>
-    struct ExtractFromOperator<void(LambdaType::*)( std::function<CallbackRes()> )>{
+    struct FromOperator<void(LambdaType::*)( std::function<CallbackRes()> )>{
         using Signature = CallbackRes();
         using FunctionType = std::function<Signature>;
         using CoResultType = void;
         using FunctionResultType = CallbackRes;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that returns value
-            template<class AwaitableToPlaceResult, class Value>
-            static bool SetupWithValueForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Value&& result
-            ){
-                setupLambda(
-                    Decorator::decorate(
-                        [   =,
-                            //captured copy shall be able to exist a for long time
-                            storedResult=std::remove_reference_t<Value>(
-                                std::forward<Value>(result)
-                            )
-                        ](){
-                            handle(); //resume the coroutine
-                            // storedResult is alive as long as capture exists
-                            return storedResult;
-                        }
-                    )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
 
-            //Invoke setup with resuming function that calculates result
-            template<class AwaitableToPlaceResult, class Function>
-            static bool SetupWithFunctionForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Function&& resultGetter
-            ){
-                setupLambda(
-                    Decorator::decorate(
-                        [   =,
-                            //captured copy shall be able to exist a for long time
-                            calculateResult=std::remove_reference_t<Function>(
-                                std::forward<Function>(resultGetter)
-                            )
-                        ](){
-                            handle(); //resume the coroutine
-                            // calculateResult is alive as long as capture exists
-                            return calculateResult();
-                        }
-                    )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
-        };
+        //Invoke setup with resuming function that returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static bool SetupCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](){
+                        handle(); //resume the coroutine
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        //Invoke setup with resuming function that calculates result
+        template<class AwaitableToPlaceResult, class Function>
+        static bool SetupCBReturnsResultOfCall(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Function&& resultGetter
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        calculateResult=std::remove_reference_t<Function>(
+                            std::forward<Function>(resultGetter)
+                        )
+                    ](){
+                        handle(); //resume the coroutine
+                        // calculateResult is alive as long as capture exists
+                        return calculateResult();
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
     };
 
     //single argument version, lambda optionally can complete synchronously
     template<class OperatorResult, class LambdaType, class CallbackRes, class CallbackArg>
-    struct ExtractFromOperator<
+    struct FromOperator<
         OperatorResult(LambdaType::*)( std::function<CallbackRes(CallbackArg)> )
     >{
         using Signature = CallbackRes(CallbackArg);
@@ -1056,101 +1305,24 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = CallbackArg;
         using FunctionResultType = CallbackRes;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers argument and returns value
-            template<class AwaitableToPlaceResult, class Value>
-            static bool SetupWithValueForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Value&& result
-            ){
-                static_assert(
-                    std::same_as< OperatorResult, std::optional<CallbackArg> >,
-                    "Call to lambda shall return void or std::optional<CallbackArg>\n"
-                    "(present value means result is ready immediately)"
-                );
 
-                return ProcessResult<OperatorResult, CoResultType, AwaitableToPlaceResult>(
-                    setupLambda(
-                        Decorator::decorate(
-                            [   =,
-                                //captured copy shall be able to exist a for long time
-                                storedResult=std::remove_reference_t<Value>(
-                                    std::forward<Value>(result)
-                                )
-                            ](CallbackArg arg){
-                                self->EmplaceCoResult(arg); //what will be returned to coroutine
-                                handle(); 
-                                // storedResult is alive as long as capture exists
-                                return storedResult;
-                            }
-                        )
-                    ),
-                    self
-                );
-            }
+        //Invoke setup with resuming function that remembers argument and returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static bool SetupCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            static_assert(
+                std::same_as< OperatorResult, std::optional<CallbackArg> >,
+                "Call to lambda shall return void or std::optional<CallbackArg>\n"
+                "(present value means result is ready immediately)"
+            );
 
-            //Invoke setup with resuming function that remembers argument and calculates result
-            template<class AwaitableToPlaceResult, class Function>
-            static bool SetupWithFunctionForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Function&& resultGetter
-            ){
-                static_assert(
-                    std::same_as< OperatorResult, std::optional<CallbackArg> >,
-                    "Call to lambda shall return void or std::optional<CallbackArg>\n"
-                    "(present value means result is ready immediately)"
-                );
-
-                return ProcessResult<OperatorResult, CoResultType, AwaitableToPlaceResult>(
-                    setupLambda(
-                        Decorator::decorate(
-                            [   =,
-                                //captured copy shall be able to exist a for long time
-                                calculateResult=std::remove_reference_t<Function>(
-                                    std::forward<Function>(resultGetter)
-                                )
-                            ](CallbackArg arg){
-                                self->EmplaceCoResult(arg); //what will be returned to coroutine
-                                handle(); 
-                                // calculateResult is alive as long capture exists
-                                return calculateResult();
-                            }
-                        )
-                    ),
-                    self
-                );
-            }
-        };
-    };
-    //single argument version, lambda always starts asynchronous operation
-    template<class LambdaType, class CallbackRes, class CallbackArg>
-    struct ExtractFromOperator<
-        void(LambdaType::*)( std::function<CallbackRes(CallbackArg)> )
-    >{
-        using Signature = CallbackRes(CallbackArg);
-        using FunctionType = std::function<Signature>;
-        using CoResultType = CallbackArg;
-        using FunctionResultType = CallbackRes;
-
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers argument and returns value
-            template<class AwaitableToPlaceResult, class Value>
-            static bool SetupWithValueForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Value&& result
-            ){
+            return ProcessResult<CoResultType, AwaitableToPlaceResult>(
                 setupLambda(
-                    Decorator::decorate(
+                    self->Decorate(
                         [   =,
                             //captured copy shall be able to exist a for long time
                             storedResult=std::remove_reference_t<Value>(
@@ -1163,20 +1335,28 @@ namespace CoroFork_SupportNamespace{
                             return storedResult;
                         }
                     )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
+                ),
+                self
+            );
+        }
 
-            //Invoke setup with resuming function that remembers argument and calculates result
-            template<class AwaitableToPlaceResult, class Function>
-            static bool SetupWithFunctionForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Function&& resultGetter
-            ){
+        //Invoke setup with resuming function that remembers argument and calculates result
+        template<class AwaitableToPlaceResult, class Function>
+        static bool SetupCBReturnsResultOfCall(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Function&& resultGetter
+        ){
+            static_assert(
+                std::same_as< OperatorResult, std::optional<CallbackArg> >,
+                "Call to lambda shall return void or std::optional<CallbackArg>\n"
+                "(present value means result is ready immediately)"
+            );
+
+            return ProcessResult<CoResultType, AwaitableToPlaceResult>(
                 setupLambda(
-                    Decorator::decorate(
+                    self->Decorate(
                         [   =,
                             //captured copy shall be able to exist a for long time
                             calculateResult=std::remove_reference_t<Function>(
@@ -1189,15 +1369,78 @@ namespace CoroFork_SupportNamespace{
                             return calculateResult();
                         }
                     )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
-        };
+                ),
+                self
+            );
+        }
+    };
+    //single argument version, lambda always starts asynchronous operation
+    template<class LambdaType, class CallbackRes, class CallbackArg>
+    struct FromOperator<
+        void(LambdaType::*)( std::function<CallbackRes(CallbackArg)> )
+    >{
+        using Signature = CallbackRes(CallbackArg);
+        using FunctionType = std::function<Signature>;
+        using CoResultType = CallbackArg;
+        using FunctionResultType = CallbackRes;
+
+
+        //Invoke setup with resuming function that remembers argument and returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static bool SetupCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](CallbackArg arg){
+                        self->EmplaceCoResult(arg); //what will be returned to coroutine
+                        handle(); 
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        //Invoke setup with resuming function that remembers argument and calculates result
+        template<class AwaitableToPlaceResult, class Function>
+        static bool SetupCBReturnsResultOfCall(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Function&& resultGetter
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        calculateResult=std::remove_reference_t<Function>(
+                            std::forward<Function>(resultGetter)
+                        )
+                    ](CallbackArg arg){
+                        self->EmplaceCoResult(arg); //what will be returned to coroutine
+                        handle(); 
+                        // calculateResult is alive as long capture exists
+                        return calculateResult();
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
     };
 
     //multiple argument version, lambda optionally can complete synchronously
     template<class OperatorResult, class LambdaType, class CallbackRes, class... CallbackArgs>
-    struct ExtractFromOperator<
+    struct FromOperator<
         OperatorResult(LambdaType::*)( std::function<CallbackRes(CallbackArgs...)> )
     >{
         using Signature = CallbackRes(CallbackArgs...);
@@ -1205,101 +1448,24 @@ namespace CoroFork_SupportNamespace{
         using CoResultType = std::tuple<CallbackArgs...>;
         using FunctionResultType = CallbackRes;
 
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers arguments and returns value
-            template<class AwaitableToPlaceResult, class Value>
-            static bool SetupWithValueForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Value&& result
-            ){
-                static_assert(
-                    std::same_as< OperatorResult, std::optional<CoResultType> >,
-                    "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
-                    "(present value means result is ready immediately)"
-                );
 
-                return ProcessResult<OperatorResult, CoResultType, AwaitableToPlaceResult>(
-                    setupLambda(
-                        Decorator::decorate(
-                            [   =,
-                                //captured copy shall be able to exist a for long time
-                                storedResult=std::remove_reference_t<Value>( 
-                                    std::forward<Value>(result)
-                                )
-                            ](CallbackArgs... args){
-                                self->EmplaceCoResult(args...); //what will be returned to coroutine
-                                handle(); 
-                                // storedResult is alive as long as capture copy exists
-                                return storedResult;
-                            }
-                        )
-                    ),
-                    self
-                );
-            }
+        //Invoke setup with resuming function that remembers arguments and returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static bool SetupCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            static_assert(
+                std::same_as< OperatorResult, std::optional<CoResultType> >,
+                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "(present value means result is ready immediately)"
+            );
 
-            //Invoke setup with resuming function that remembers argument and calculates result
-            template<class AwaitableToPlaceResult, class Function>
-            static bool SetupWithFunctionForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Function&& resultGetter
-            ){
-                static_assert(
-                    std::same_as< OperatorResult, std::optional<CoResultType> >,
-                    "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
-                    "(present value means result is ready immediately)"
-                );
-
-                return ProcessResult<OperatorResult, CoResultType, AwaitableToPlaceResult>(
-                    setupLambda(
-                        Decorator::decorate(
-                            [   =,
-                                //captured copy shall be able to exist a for long time
-                                calculateResult=std::remove_reference_t<Function>(
-                                    std::forward<Function>(resultGetter)
-                                )
-                            ](CallbackArgs... args){
-                                self->EmplaceCoResult(args...); //what will be returned to coroutine
-                                handle(); 
-                                // calculateResult is alive as long as std::function copy exists
-                                return calculateResult();
-                            }
-                        )
-                    ),
-                    self
-                );
-            }
-        };
-    };
-    //multiple argument version, lambda always starts asynchronous operation
-    template<class LambdaType, class CallbackRes, class... CallbackArgs>
-    struct ExtractFromOperator<
-        void(LambdaType::*)( std::function<CallbackRes(CallbackArgs...)> )
-    >{
-        using Signature = CallbackRes(CallbackArgs...);
-        using FunctionType = std::function<Signature>;
-        using CoResultType = std::tuple<CallbackArgs...>;
-        using FunctionResultType = CallbackRes;
-
-        /// Allow generated function to be additionally decorated
-        template<class Decorator>
-        struct Decorated{
-            //Invoke setup with resuming function that remembers arguments and returns value
-            template<class AwaitableToPlaceResult, class Value>
-            static bool SetupWithValueForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Value&& result
-            ){
+            return ProcessResult<CoResultType, AwaitableToPlaceResult>(
                 setupLambda(
-                    Decorator::decorate(
+                    self->Decorate(
                         [   =,
                             //captured copy shall be able to exist a for long time
                             storedResult=std::remove_reference_t<Value>( 
@@ -1312,20 +1478,28 @@ namespace CoroFork_SupportNamespace{
                             return storedResult;
                         }
                     )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
+                ),
+                self
+            );
+        }
 
-            //Invoke setup with resuming function that remembers argument and calculates result
-            template<class AwaitableToPlaceResult, class Function>
-            static bool SetupWithFunctionForResult(
-                AwaitableToPlaceResult* self,
-                std::coroutine_handle<> handle,
-                const LambdaType& setupLambda,
-                Function&& resultGetter
-            ){
+        //Invoke setup with resuming function that remembers argument and calculates result
+        template<class AwaitableToPlaceResult, class Function>
+        static bool SetupCBReturnsResultOfCall(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Function&& resultGetter
+        ){
+            static_assert(
+                std::same_as< OperatorResult, std::optional<CoResultType> >,
+                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "(present value means result is ready immediately)"
+            );
+
+            return ProcessResult<CoResultType, AwaitableToPlaceResult>(
                 setupLambda(
-                    Decorator::decorate(
+                    self->Decorate(
                         [   =,
                             //captured copy shall be able to exist a for long time
                             calculateResult=std::remove_reference_t<Function>(
@@ -1338,10 +1512,73 @@ namespace CoroFork_SupportNamespace{
                             return calculateResult();
                         }
                     )
-                );
-                return true; //means stay suspended (this is ok even if already resumed)
-            }
-        };
+                ),
+                self
+            );
+        }
+    };
+    //multiple argument version, lambda always starts asynchronous operation
+    template<class LambdaType, class CallbackRes, class... CallbackArgs>
+    struct FromOperator<
+        void(LambdaType::*)( std::function<CallbackRes(CallbackArgs...)> )
+    >{
+        using Signature = CallbackRes(CallbackArgs...);
+        using FunctionType = std::function<Signature>;
+        using CoResultType = std::tuple<CallbackArgs...>;
+        using FunctionResultType = CallbackRes;
+
+
+        //Invoke setup with resuming function that remembers arguments and returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static bool SetupCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>( 
+                            std::forward<Value>(result)
+                        )
+                    ](CallbackArgs... args){
+                        self->EmplaceCoResult(args...); //what will be returned to coroutine
+                        handle(); 
+                        // storedResult is alive as long as capture copy exists
+                        return storedResult;
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        //Invoke setup with resuming function that remembers argument and calculates result
+        template<class AwaitableToPlaceResult, class Function>
+        static bool SetupCBReturnsResultOfCall(
+            AwaitableToPlaceResult* self,
+            std::coroutine_handle<> handle,
+            const LambdaType& setupLambda,
+            Function&& resultGetter
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        calculateResult=std::remove_reference_t<Function>(
+                            std::forward<Function>(resultGetter)
+                        )
+                    ](CallbackArgs... args){
+                        self->EmplaceCoResult(args...); //what will be returned to coroutine
+                        handle(); 
+                        // calculateResult is alive as long as std::function copy exists
+                        return calculateResult();
+                    }
+                )
+            );
+            return true; //means stay suspended (this is ok even if already resumed)
+        }
     };
 
 
@@ -1349,32 +1586,32 @@ namespace CoroFork_SupportNamespace{
     // redirect other possible signatures for std::function
 
     template<class OperatorResult, class LambdaType, class FunctionSignature>
-    struct ExtractFromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> ) const>
-        : public ExtractFromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> )> {};
+    struct FromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> ) const>
+        : public FromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> )> {};
 
     template<class OperatorResult, class LambdaType, class FunctionSignature>
-    struct ExtractFromOperator<OperatorResult(LambdaType::*)( const std::function<FunctionSignature>& )>
-        : public ExtractFromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> )> {};
+    struct FromOperator<OperatorResult(LambdaType::*)( const std::function<FunctionSignature>& )>
+        : public FromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> )> {};
 
     template<class OperatorResult, class LambdaType, class FunctionSignature>
-    struct ExtractFromOperator<OperatorResult(LambdaType::*)( const std::function<FunctionSignature>& ) const>
-        : public ExtractFromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> )> {};
+    struct FromOperator<OperatorResult(LambdaType::*)( const std::function<FunctionSignature>& ) const>
+        : public FromOperator<OperatorResult(LambdaType::*)( std::function<FunctionSignature> )> {};
 
 
     //__________________________________________________________________________
     // Raw callback reuses logic applicable to std::function 
 
     template<class OperatorResult, class LambdaType, class CallbackRes, class... CallbackArgs>
-    struct ExtractFromOperator<OperatorResult(LambdaType::*)( CallbackRes(*)(CallbackArgs...) )>
-        : public ExtractFromOperator<
+    struct FromOperator<OperatorResult(LambdaType::*)( CallbackRes(*)(CallbackArgs...) )>
+        : public FromOperator<
                     OperatorResult(LambdaType::*)( std::function<CallbackRes(CallbackArgs...)> )
                  >
     {
         using RawPointerCallbackType = CallbackRes(*)(CallbackArgs...);
     };
     template<class OperatorResult, class LambdaType, class CallbackRes, class... CallbackArgs>
-    struct ExtractFromOperator<OperatorResult(LambdaType::*)( CallbackRes(*)(CallbackArgs...) ) const>
-        : public ExtractFromOperator<
+    struct FromOperator<OperatorResult(LambdaType::*)( CallbackRes(*)(CallbackArgs...) ) const>
+        : public FromOperator<
                     OperatorResult(LambdaType::*)( std::function<CallbackRes(CallbackArgs...)> )
                  >
     {
@@ -1411,10 +1648,10 @@ namespace CoroFork_SupportNamespace{
         class CoResult,
         class SetupLambdaType
     >
-    class AwaitableWithSimpleCallback {
+    class AwaitableSimpleCB: public Decorator{
     public:
         /// Tie with setup lambda
-        AwaitableWithSimpleCallback(const SetupLambdaType& setupLambdaToUse)
+        AwaitableSimpleCB(const SetupLambdaType& setupLambdaToUse)
             : setupLambda(setupLambdaToUse) {}
 
         /// Suspends (await_suspend must see handle before setup lambda is invoked)
@@ -1425,9 +1662,9 @@ namespace CoroFork_SupportNamespace{
             std::coroutine_handle<> handle ///< represent the current coroutine
         ) {
             return ExtractFromLambda<SetupLambdaType>
-            ::template Decorated<Decorator>::SetupWithSimpleCallback(
-                this, handle, setupLambda
-            );
+                ::SetupSimpleCB(
+                    this, handle, setupLambda
+                );
         }
         
         /// The value, that goes to coroutine as a result of co_await
@@ -1454,10 +1691,10 @@ namespace CoroFork_SupportNamespace{
 
     /// Specialization for waitable being used by invert_function (simple case)
     template<class Decorator, class SetupLambdaType>
-    class AwaitableWithSimpleCallback<Decorator, void, SetupLambdaType>{
+    class AwaitableSimpleCB<Decorator, void, SetupLambdaType>: public Decorator{
     public:
         /// Tie with setup lambda
-        AwaitableWithSimpleCallback(const SetupLambdaType& setupLambdaToUse)
+        AwaitableSimpleCB(const SetupLambdaType& setupLambdaToUse)
             : setupLambda(setupLambdaToUse) {}
 
         /// Always suspends (shall not skip await_suspend)
@@ -1468,9 +1705,9 @@ namespace CoroFork_SupportNamespace{
             std::coroutine_handle<> handle ///< represent the current coroutine
         ) {
             return ExtractFromLambda<SetupLambdaType>
-            ::template Decorated<Decorator>::SetupWithSimpleCallback(
-                this, handle, setupLambda
-            );
+                ::SetupSimpleCB(
+                    this, handle, setupLambda
+                );
         }
         
         /// Returns nothing to coroutine
@@ -1496,17 +1733,23 @@ namespace CoroFork_SupportNamespace{
         class SetupLambdaType,
         class GeneratedCallbackResultType
     >
-    class AwaitableGeneratedCallbackReturnsValue{
+    class AwaitableGeneratedCBReturnsValue: public Decorator{
     public:
         /// Tie with setup lambda
         template<class ValueType>
-        AwaitableGeneratedCallbackReturnsValue(
+        AwaitableGeneratedCBReturnsValue(
             const SetupLambdaType& setupLambdaToUse,
             ValueType&& whatGeneratedCallbackReturns
         )
             : setupLambda(setupLambdaToUse)
             , valueGeneratedCallbackReturns(std::forward<ValueType>(whatGeneratedCallbackReturns))
         {}
+
+        //non copyable but movable 
+        AwaitableGeneratedCBReturnsValue(const AwaitableGeneratedCBReturnsValue&) = delete;
+        AwaitableGeneratedCBReturnsValue& operator=(const AwaitableGeneratedCBReturnsValue&) = delete;
+        AwaitableGeneratedCBReturnsValue(AwaitableGeneratedCBReturnsValue&&) = default;
+        AwaitableGeneratedCBReturnsValue& operator=(AwaitableGeneratedCBReturnsValue&&) = default;
 
         /// Suspends (await_suspend must see handle before setup lambda is invoked)
         constexpr bool await_ready() const noexcept { return false;  }
@@ -1516,10 +1759,10 @@ namespace CoroFork_SupportNamespace{
             std::coroutine_handle<> handle ///< represent the current coroutine
         ) {
             return ExtractFromLambda<SetupLambdaType>
-            ::template Decorated<Decorator>::SetupWithValueForResult(
-                this, handle, setupLambda,
-                std::move(valueGeneratedCallbackReturns) //definitely we do not need that value any more
-            );
+                ::SetupCBReturnsValue(
+                    this, handle, setupLambda,
+                    std::move(valueGeneratedCallbackReturns) //definitely we do not need that value any more
+                );
         }
         
         /// The value, that goes to coroutine as a result of co_await
@@ -1550,19 +1793,25 @@ namespace CoroFork_SupportNamespace{
 
     /// Specialization for waitable being used by invert_function (case of value)
     template<class Decorator, class SetupLambdaType, class GeneratedCallbackResultType>
-    class AwaitableGeneratedCallbackReturnsValue<
+    class AwaitableGeneratedCBReturnsValue<
         Decorator, void, SetupLambdaType, GeneratedCallbackResultType
-    >{
+    >: public Decorator{
     public:
         /// Tie with setup lambda
         template<class ValueType>
-        AwaitableGeneratedCallbackReturnsValue(
+        AwaitableGeneratedCBReturnsValue(
             const SetupLambdaType& setupLambdaToUse,
             ValueType&& whatGeneratedCallbackReturns
         )
             : setupLambda(setupLambdaToUse)
             , valueGeneratedCallbackReturns(std::forward<ValueType>(whatGeneratedCallbackReturns))
         {}
+
+        //non copyable but movable 
+        AwaitableGeneratedCBReturnsValue(const AwaitableGeneratedCBReturnsValue&) = delete;
+        AwaitableGeneratedCBReturnsValue& operator=(const AwaitableGeneratedCBReturnsValue&) = delete;
+        AwaitableGeneratedCBReturnsValue(AwaitableGeneratedCBReturnsValue&&) = default;
+        AwaitableGeneratedCBReturnsValue& operator=(AwaitableGeneratedCBReturnsValue&&) = default;
 
         /// Always suspends (shall not skip await_suspend)
         constexpr bool await_ready() const noexcept { return false;  }
@@ -1572,10 +1821,10 @@ namespace CoroFork_SupportNamespace{
             std::coroutine_handle<> handle ///< represent the current coroutine
         ) {
             return ExtractFromLambda<SetupLambdaType>
-            ::template Decorated<Decorator>::SetupWithValueForResult(
-                this, handle, setupLambda,
-                std::move(valueGeneratedCallbackReturns) //definitely we do not need that value any more
-            );
+                ::SetupCBReturnsValue(
+                    this, handle, setupLambda,
+                    std::move(valueGeneratedCallbackReturns) //definitely we do not need that value any more
+                );
         }
         
         /// Returns nothing to coroutine
@@ -1605,11 +1854,11 @@ namespace CoroFork_SupportNamespace{
         class SetupLambdaType,
         class CallbackToCallFromGeneratedCallbackType
     >
-    class AwaitableGeneratedCallbackReturnsResultOfCall{
+    class AwaitableGeneratedCBReturnsResultOfCall: public Decorator{
     public:
         /// Tie with setup lambda
         template<class CalculateResultFunctionType>
-        AwaitableGeneratedCallbackReturnsResultOfCall(
+        AwaitableGeneratedCBReturnsResultOfCall(
             const SetupLambdaType& setupLambdaToUse,
             CalculateResultFunctionType&& whatGeneratedCallbackReturns
         )
@@ -1619,6 +1868,12 @@ namespace CoroFork_SupportNamespace{
               )
         {}
 
+        //non copyable but movable 
+        AwaitableGeneratedCBReturnsResultOfCall(const AwaitableGeneratedCBReturnsResultOfCall&) = delete;
+        AwaitableGeneratedCBReturnsResultOfCall& operator=(const AwaitableGeneratedCBReturnsResultOfCall&) = delete;
+        AwaitableGeneratedCBReturnsResultOfCall(AwaitableGeneratedCBReturnsResultOfCall&&) = default;
+        AwaitableGeneratedCBReturnsResultOfCall& operator=(AwaitableGeneratedCBReturnsResultOfCall&&) = default;
+
         /// Suspends (await_suspend must see handle before setup lambda is invoked)
         constexpr bool await_ready() const noexcept { return false;  }
         
@@ -1627,10 +1882,10 @@ namespace CoroFork_SupportNamespace{
             std::coroutine_handle<> handle ///< represent the current coroutine
         ) {
             return ExtractFromLambda<SetupLambdaType>
-            ::template Decorated<Decorator>::SetupWithFunctionForResult(
-                this, handle, setupLambda,
-                std::move(callbackToCallFromGeneratedCallback)
-            );
+                ::SetupCBReturnsResultOfCall(
+                    this, handle, setupLambda,
+                    std::move(callbackToCallFromGeneratedCallback)
+                );
         }
         
         /// The value, that goes to coroutine as a result of co_await
@@ -1661,13 +1916,13 @@ namespace CoroFork_SupportNamespace{
 
     /// Specialization for waitable being used by invert_function (case of callback returning result)
     template<class Decorator, class SetupLambdaType, class CallbackToCallFromGeneratedCallbackType>
-    class AwaitableGeneratedCallbackReturnsResultOfCall<
+    class AwaitableGeneratedCBReturnsResultOfCall<
         Decorator, void, SetupLambdaType, CallbackToCallFromGeneratedCallbackType
-    >{
+    >: public Decorator{
     public:
         /// Tie with setup lambda
         template<class CalculateResultFunctionType>
-        AwaitableGeneratedCallbackReturnsResultOfCall(
+        AwaitableGeneratedCBReturnsResultOfCall(
             const SetupLambdaType& setupLambdaToUse,
             CalculateResultFunctionType&& whatGeneratedCallbackReturns
         )
@@ -1677,6 +1932,12 @@ namespace CoroFork_SupportNamespace{
               )
         {}
 
+        //non copyable but movable 
+        AwaitableGeneratedCBReturnsResultOfCall(const AwaitableGeneratedCBReturnsResultOfCall&) = delete;
+        AwaitableGeneratedCBReturnsResultOfCall& operator=(const AwaitableGeneratedCBReturnsResultOfCall&) = delete;
+        AwaitableGeneratedCBReturnsResultOfCall(AwaitableGeneratedCBReturnsResultOfCall&&) = default;
+        AwaitableGeneratedCBReturnsResultOfCall& operator=(AwaitableGeneratedCBReturnsResultOfCall&&) = default;
+
         /// Always suspends (shall not skip await_suspend)
         constexpr bool await_ready() const noexcept { return false;  }
         
@@ -1685,10 +1946,10 @@ namespace CoroFork_SupportNamespace{
             std::coroutine_handle<> handle ///< represent the current coroutine
         ) {
             return ExtractFromLambda<SetupLambdaType>
-            ::template Decorated<Decorator>::SetupWithFunctionForResult(
-                this, handle, setupLambda,
-                std::move(callbackToCallFromGeneratedCallback)
-            );
+                ::SetupCBReturnsResultOfCall(
+                    this, handle, setupLambda,
+                    std::move(callbackToCallFromGeneratedCallback)
+                );
         }
         
         /// Returns nothing to coroutine
@@ -1702,6 +1963,7 @@ namespace CoroFork_SupportNamespace{
          *  (for the time of full expression) */
         std::remove_reference_t<CallbackToCallFromGeneratedCallbackType> callbackToCallFromGeneratedCallback;
     };
+
 
     //__________________________________________________________________________
     //##########################################################################
@@ -1726,12 +1988,17 @@ namespace CoroFork_SupportNamespace{
         using SimpleSignature = Res(Args...);
     };
 
+
     /// Access for apply for creating callback_extend_lifetime 
     class CallbackExtendLifetimeImpl: public callback_extend_lifetime{
     public:
         /// Make constructor visible for apply
         CallbackExtendLifetimeImpl(){}
     };
+
+
+    //__________________________________________________________________________
+    // callback_from_lambda: nodes and generated API
 
     /// General node for lambda allocation (chain of nodes is generated in LambdaListNodeGenerator)
     template<class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*)>
@@ -1749,16 +2016,17 @@ namespace CoroFork_SupportNamespace{
         /// Destructor to do nothing (assume there is no lambda)
         ~LambdaListNode(){}
 
-        union{
-            /// Hold corresponding "simple function pointer"/callback when is free
-            SimpleSignature* individualTrampoline;
-            
+        /// Hold corresponding "simple function pointer"/callback when is free
+        SimpleSignature* const individualTrampoline;
+
+
+        union{            
             /// Lambda being wrapped when is allocated
             LambdaType lambda;
-        };
 
-        /// Link to next node for lambda
-        LambdaListNode* next;
+            /// Link to next node for lambda
+            LambdaListNode* next;
+        };
 
         /// Only the one who instantiated or is aware how to free that node
         void Free(){
@@ -1769,49 +2037,45 @@ namespace CoroFork_SupportNamespace{
 
     /// Meta function to obtain code for LambdaType::operator()
     template<class LambdaListNodeType, class MethodSignature>
-    struct ObtainSimpleFunction;
+    struct ObtainSimpleAutoFreeFunction;
 
     /// Specialization to obtain code for LambdaType::operator()
     template<class LambdaListNodeType, class Res, class LambdaType, class... Args>
-    struct ObtainSimpleFunction<LambdaListNodeType, Res(LambdaType::*)(Args...)>{
-        template<LambdaListNodeType* obj>
+    struct ObtainSimpleAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(Args...)>{
+        template<void* self>
         struct For{
             static Res apply(Args... args){
-                // copy is needed to allow recursive allocation
-                auto copyOfLambda = static_cast<LambdaType&&>(obj->lambda);
-                // corresponding lambda moved from but still needs to be destructed
-                obj->lambda.~LambdaType();
-                // remember simple function again, to be used next time
-                obj->individualTrampoline = apply;
+                // moved copy is needed to allow recursive allocation
+                auto copyOfLambda = static_cast<LambdaType&&>(
+                    static_cast<LambdaListNodeType*>(self)->lambda
+                );
+
                 // free corresponding node
-                obj->Free();
-                //call the copy
+                static_cast<LambdaListNodeType*>(self)->Free();
+                
+                //call the mover copy
                 return copyOfLambda(static_cast<Args&&>(args)...);
             }
         };
     };
     /// Specialization to obtain code for LambdaType::operator() const
     template<class LambdaListNodeType, class Res, class LambdaType, class... Args>
-    struct ObtainSimpleFunction<LambdaListNodeType, Res(LambdaType::*)(Args...) const>:
-        public ObtainSimpleFunction<LambdaListNodeType, Res(LambdaType::*)(Args...)> //reuse existing
+    struct ObtainSimpleAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(Args...) const>:
+        public ObtainSimpleAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(Args...)> //reuse existing
     {};
 
     /// Specialization to obtain code for lambda that controls own lifetime
     template<class LambdaListNodeType, class Res, class LambdaType, class... Args>
-    struct ObtainSimpleFunction<LambdaListNodeType, Res(LambdaType::*)(callback_extend_lifetime&, Args...)>{
-        template<LambdaListNodeType* obj>
+    struct ObtainSimpleAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(callback_extend_lifetime&, Args...)>{
+        template<void* self>
         struct For{
             static Res apply(Args... args){
                 CallbackExtendLifetimeImpl extendLifetime;
-                Res res = obj->lambda(extendLifetime, static_cast<Args&&>(args)...);
+                Res res = static_cast<LambdaListNodeType*>(self)->lambda(extendLifetime, static_cast<Args&&>(args)...);
                 
-                if( extendLifetime.IsDisposed() ){
-                    // lambda explicitly schedules disposal
-                    obj->lambda.~LambdaType();
-                    // remember simple function again, to be used next time
-                    obj->individualTrampoline = apply;
+                if( extendLifetime.is_disposed() ){
                     // free corresponding node
-                    obj->Free();
+                    static_cast<LambdaListNodeType*>(self)->Free();
                 }
 
                 return res;
@@ -1820,115 +2084,173 @@ namespace CoroFork_SupportNamespace{
     };
     /// Specialization to obtain code for void lambda that controls own lifetime
     template<class LambdaListNodeType, class LambdaType, class... Args>
-    struct ObtainSimpleFunction<LambdaListNodeType, void(LambdaType::*)(callback_extend_lifetime&, Args...)>{
-        template<LambdaListNodeType* obj>
+    struct ObtainSimpleAutoFreeFunction<LambdaListNodeType, void(LambdaType::*)(callback_extend_lifetime&, Args...)>{
+        template<void* self>
         struct For{
             static void apply(Args... args){
                 CallbackExtendLifetimeImpl extendLifetime;
-                obj->lambda(extendLifetime, static_cast<Args&&>(args)...);
+                static_cast<LambdaListNodeType*>(self)->lambda(extendLifetime, static_cast<Args&&>(args)...);
                 
-                if( extendLifetime.IsDisposed() ){
-                    // lambda explicitly schedules disposal
-                    obj->lambda.~LambdaType();
-                    // remember simple function again, to be used next time
-                    obj->individualTrampoline = apply;
+                if( extendLifetime.is_disposed() ){
                     // free corresponding node
-                    obj->Free();
+                    static_cast<LambdaListNodeType*>(self)->Free();
                 }
             }
         };
     };
     /// Specialization to obtain code for lambda that controls own lifetime
     template<class LambdaListNodeType, class Res, class LambdaType, class... Args>
-    struct ObtainSimpleFunction<LambdaListNodeType, Res(LambdaType::*)(callback_extend_lifetime&, Args...) const>:
-        public ObtainSimpleFunction<LambdaListNodeType, Res(LambdaType::*)(callback_extend_lifetime&, Args...)>
+    struct ObtainSimpleAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(callback_extend_lifetime&, Args...) const>:
+        public ObtainSimpleAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(callback_extend_lifetime&, Args...)>
     {};
 
     /// Meta function to obtain code for LambdaType
-    template<class LambdaListNodeType, class LambdaType, LambdaListNodeType* obj>
-    using ObtainSimpleFunctionFor = typename
-        ObtainSimpleFunction<LambdaListNodeType, decltype(&LambdaType::operator())>::template For<obj>;
+    template<class LambdaListNodeType, class LambdaType, void* obj>
+    using ObtainSimpleAutoFreeFunctionFor = typename
+        ObtainSimpleAutoFreeFunction<LambdaListNodeType, decltype(&LambdaType::operator())>::template For<obj>;
+
+
+    // special case of long leaving nodes
+
+    /// Meta function to obtain code for LambdaType::operator()
+    template<class LambdaListNodeType, class MethodSignature>
+    struct ObtainSimpleNoAutoFreeFunction;
+
+    /// Specialization to obtain code for LambdaType::operator()
+    template<class LambdaListNodeType, class Res, class LambdaType, class... Args>
+    struct ObtainSimpleNoAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(Args...)>{
+        template<void* self>
+        struct For{
+            static Res apply(Args... args){
+                // own copy is needed to allow recursive allocation
+                auto copyOfLambda = static_cast<LambdaType&&>(static_cast<LambdaListNodeType*>(self)->lambda);
+
+                //Not that copy is able to tp whatever it likes with lambda
+                return copyOfLambda(static_cast<Args&&>(args)...);
+            }
+        };
+    };
+    /// Specialization to obtain code for LambdaType::operator() const
+    template<class LambdaListNodeType, class Res, class LambdaType, class... Args>
+    struct ObtainSimpleNoAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(Args...) const>:
+        public ObtainSimpleNoAutoFreeFunction<LambdaListNodeType, Res(LambdaType::*)(Args...)> //reuse existing
+    {};
+
+    /// Meta function to obtain code for LambdaType
+    template<class LambdaListNodeType, class LambdaType, void* obj>
+    using ObtainSimpleNoAutoFreeFunctionFor = typename
+        ObtainSimpleNoAutoFreeFunction<LambdaListNodeType, decltype(&LambdaType::operator())>::template For<obj>;
+
+
+    //__________________________________________________________________________
+    // callback_from_lambda: generate linked list of nodes
 
 
     /// Meta function to generate linked list of LambdaListNode and corresponding trampolines
-    template<class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*), unsigned reservedCount>
+    template<
+        class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*),
+        template<class, class, void*> class ObtainSimple, //Simple API is obtained here
+        unsigned reservedCount
+    >
     struct LambdaListNodeGenerator;
 
     /// Generate source for individual caller (all except first)
-    template<class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*), unsigned reservedCount>
+    template<
+        class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*),
+        template<class, class, void*> class ObtainSimple,
+        unsigned reservedCount
+    >
     struct LambdaListNodeGenerator{
         /// Node to store corresponding lambda
         static LambdaListNode<LambdaType, AdditionalOptionalTag, freeMe> node;
     };
     /// Generate source for individual caller (the first one)
-    template<class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*)>
-    struct LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, 1>{
+    template<
+        class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*),
+        template<class, class, void*> class ObtainSimple
+    >
+    struct LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, ObtainSimple, 1>{
         /// Node to store corresponding lambda
         static LambdaListNode<LambdaType, AdditionalOptionalTag, freeMe> node;
     };
 
     //The last node storing corresponding lambda is nas no "next" node
-    template<class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*)>
+    template<
+        class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*),
+        template<class, class, void*> class ObtainSimple
+    >
     LambdaListNode<LambdaType, AdditionalOptionalTag, freeMe>
-    LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, 1>::node{
-        &ObtainSimpleFunctionFor<
+    LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, ObtainSimple, 1>::node{
+        &ObtainSimple<
             LambdaListNode<LambdaType, AdditionalOptionalTag, freeMe>,
             LambdaType,
-            &LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, 1>::node
+            &LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, ObtainSimple, 1>::node
         >::apply,
         nullptr // no "next" node
     };
     //All the rest of the nodes reference 
-    template<class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*), unsigned reservedCount>
+    template<
+        class LambdaType, class AdditionalOptionalTag, void (*freeMe)(void*),
+        template<class, class, void*> class ObtainSimple,
+        unsigned reservedCount
+    >
     LambdaListNode<LambdaType, AdditionalOptionalTag, freeMe>
-    LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, reservedCount>::node{
-        &ObtainSimpleFunctionFor<
+    LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, ObtainSimple, reservedCount>::node{
+        &ObtainSimple<
             LambdaListNode<LambdaType, AdditionalOptionalTag, freeMe>,
             LambdaType,
-            &LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, 1>::node
+            &LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, ObtainSimple, 1>::node
         >::apply,
         &LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, freeMe, reservedCount-1>::node
     };
 
-    /// Allocator encapsulating  
-    template<unsigned reservedCount, class AdditionalOptionalTag, class LambdaType>
-    class Allocator{
-    public:
+
+    //__________________________________________________________________________
+    // callback_from_lambda: managing nodes that are able to free self
+
+    /// CallbackAllocator encapsulating linked list operations
+    template<
+        unsigned reservedCount, class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    class CallbackAllocator{
         /// Freeing node (to be passed as template parameter)
-        static void FreeNode(void* rawNode);
+        static void FreeNode(void* rawNode);        
 
         /// Cut off references to ger original lambda type 
         using OriginalLambda = std::remove_reference_t<LambdaType>;
-
+    public:
         /// Type of nodes used for allocation 
         using Node = LambdaListNode<LambdaType, AdditionalOptionalTag, FreeNode>;
-        /// Signature for corresponding "simple function pointer"
-        using SimpleSignature = typename Node::SimpleSignature;
-
 
         /// Allocate item that forwards from simple function to lambda
         template<class UsedLambda>
-        static SimpleSignature* Allocate(UsedLambda&& lambda){
-            SimpleSignature* res;
+        static Node* Allocate(UsedLambda&& lambda){
+            Node* allocatedNode;
+
             {std::lock_guard<std::mutex> lock(protectAllocation);
                 if( !first ){
                     throw std::runtime_error("callback_from_lambda cannot allocate trampoline");
                 }
-                // extract pointer from union before wiping out with lambda
-                res = first->individualTrampoline;
-                // now it is possible to store lambda here using move
-                new( &first->lambda ) OriginalLambda(
-                    std::forward<UsedLambda>(lambda)
-                );
+                allocatedNode = first;
                 // step over allocated item 
                 first = first->next;
             }
-            return res;
+            // lambda is active instead of next
+            new( &allocatedNode->lambda ) OriginalLambda(
+                std::forward<UsedLambda>(lambda)
+            );
+
+            return allocatedNode;
         }
 
     private:
         /// Generator to use for obtaining linked list of nodes 
-        using Generator = LambdaListNodeGenerator<LambdaType, AdditionalOptionalTag, FreeNode, reservedCount>;
+        using Generator = LambdaListNodeGenerator<
+            LambdaType, AdditionalOptionalTag, FreeNode,
+            ObtainSimple,
+            reservedCount
+        >;
 
         /// Head of the list
         static Node* first;
@@ -1937,46 +2259,274 @@ namespace CoroFork_SupportNamespace{
         static std::mutex protectAllocation;
     };
 
-    template<unsigned reservedCount, class AdditionalOptionalTag, class LambdaType>
-    typename Allocator<reservedCount, AdditionalOptionalTag, LambdaType>::Node* 
-        Allocator<reservedCount, AdditionalOptionalTag, LambdaType>::first =
-            &Allocator<reservedCount, AdditionalOptionalTag, LambdaType>::Generator::node;
+    template<
+        unsigned reservedCount, class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    typename CallbackAllocator<reservedCount, AdditionalOptionalTag, LambdaType, ObtainSimple>::Node* 
+        CallbackAllocator<reservedCount, AdditionalOptionalTag, LambdaType, ObtainSimple>::first =
+            &CallbackAllocator<reservedCount, AdditionalOptionalTag, LambdaType, ObtainSimple>::Generator::node;
 
-    template<unsigned reservedCount, class AdditionalOptionalTag, class LambdaType>
-    inline void Allocator<reservedCount, AdditionalOptionalTag, LambdaType>::FreeNode(void* rawNode){
-        std::lock_guard<std::mutex> lock(protectAllocation);
-
+    template<
+        unsigned reservedCount, class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    inline void CallbackAllocator<reservedCount, AdditionalOptionalTag, LambdaType, ObtainSimple>::FreeNode(void* rawNode){
         auto node = static_cast<Node*>(rawNode);
-        node->next = first;
-        first = node;
+
+        //Destruct existing lambda before using next field
+        node->lambda.~LambdaType();
+
+        {std::lock_guard<std::mutex> lock(protectAllocation);
+            node->next = first;
+            first = node;
+        }
     }
 
-
     // additional static member is needed for EnterCritical/LeaveCritical
-    template<unsigned reservedCount, class AdditionalOptionalTag, class LambdaType>
+    template<
+        unsigned reservedCount, class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
     std::mutex 
-    Allocator<reservedCount, AdditionalOptionalTag, LambdaType>::protectAllocation;
-} //namespace CoroFork_SupportNamespace
+    CallbackAllocator<reservedCount, AdditionalOptionalTag, LambdaType, ObtainSimple>::protectAllocation;
 
 
-inline void callback_extend_lifetime::Dispose(){
+    // now specialization for the case of one node
+    // for debugging purposes #define COROFORK_SUPPRESS_SPECIALIZATION
+#   ifndef COROFORK_SUPPRESS_SPECIALIZATION
+
+    /// CallbackAllocator with single item  
+    template<
+        class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    class CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>{
+        /// Freeing node (to be passed as template parameter)
+        static void FreeSingleNode(void* rawNode);
+
+        /// Cut off references to ger original lambda type 
+        using OriginalLambda = std::remove_reference_t<LambdaType>;
+    public:
+        /// Type of nodes used for allocation 
+        using Node = LambdaListNode<LambdaType, AdditionalOptionalTag, FreeSingleNode>;
+
+        /// Allocate item that forwards from simple function to lambda
+        template<class UsedLambda>
+        static Node* Allocate(UsedLambda&& lambda){
+            if( isAllocated ){
+                throw std::runtime_error("callback_from_lambda cannot allocate trampoline");
+            }
+            isAllocated = true;
+
+            // lambda is active instead of next
+            new( &theOnlyNode.lambda ) OriginalLambda(
+                std::forward<UsedLambda>(lambda)
+            );
+
+            // Returns well known generated node
+            return &theOnlyNode;
+        }
+
+    private:
+        /// Single item owned by "one item capacity allocator"
+        static Node theOnlyNode;
+
+        /// Hack for asserting existing allocation
+        /** ignore thread safety here))
+         *  Used only for assertion purposes with single item allocation.
+         *  We assume one will not use single item allocation in case
+         *  of multiple threads */
+        static bool isAllocated;
+    public:
+        using ObtainSimpleShortcut = ObtainSimple<
+            Node,
+            LambdaType, 
+            &CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>::theOnlyNode
+        >;
+    };
+
+    template<
+        class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    typename CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>::Node
+        CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>::theOnlyNode(
+            &CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>::ObtainSimpleShortcut::apply,
+            nullptr
+        );
+
+    template<
+        class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    bool CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>::isAllocated = false;
+
+    template<
+        class AdditionalOptionalTag, class LambdaType,
+        template<class, class, void*> class ObtainSimple
+    >
+    inline void CallbackAllocator<1, AdditionalOptionalTag, LambdaType, ObtainSimple>::FreeSingleNode(void* rawNode){
+        //Destruct existing lambda before using next field
+        theOnlyNode.lambda.~LambdaType();
+
+        //Mark existing only node as free
+        isAllocated = false;
+    }
+#   endif
+
+    //__________________________________________________________________________
+    // Implement utility stuff
+
+    /// Default customization for generated callback (no custom wrapping)
+    struct TheSame{
+        /// Returns argument as is
+        template<class WrappedCallback>
+        constexpr std::remove_reference_t<WrappedCallback>&&
+        Decorate(WrappedCallback&& cb) noexcept{
+            return std::move(cb);
+        }
+    };
+
+    /// Customization that turns std::function to "plain C" callback
+    template<
+        std::size_t maxCallbacksCount,
+        class AdditionalOptionalTag
+    >
+    class ToPlainC{
+        using KeepAlive = std::unique_ptr<void, void(*)(void*)>;
+    public:
+        /// Return argument wrapped into "plain C" callback
+        template<class WrappedCallback>
+        auto Decorate(WrappedCallback&& cb) noexcept{
+            using Allocator = CallbackAllocator<
+                maxCallbacksCount,
+                AdditionalOptionalTag,
+                std::remove_reference_t<WrappedCallback>,
+                ObtainSimpleNoAutoFreeFunctionFor
+            >;
+            auto node = Allocator::Allocate(
+                std::forward<WrappedCallback>(cb)
+            );
+            keepAlive = KeepAlive(
+                node,
+                [](void* allocation){
+                    static_cast<Allocator::Node*>(allocation)->Free();
+                }
+            );
+
+            return node->individualTrampoline;
+        }
+    private:
+        /// Ensures callback will be valid as long as ToPlainC exists
+        KeepAlive keepAlive{nullptr, [](void*){}};
+    };
+} //namespace CoroFork_detail
+
+
+template<unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType>
+auto callback_from_lambda(UniqueLambdaType&& lambda) -> 
+    CoroFork_detail::SimpleSignatureFromLambda<UniqueLambdaType>*
+{
+    /* lambda will be moved to internal block pool
+       and "auto free" strategy is applied,
+       one shall not allocate nodes manually  */
+    return CoroFork_detail::CallbackAllocator<
+        reservedCount,
+        AdditionalOptionalTag,
+        std::remove_reference_t<UniqueLambdaType>,
+        CoroFork_detail::ObtainSimpleAutoFreeFunctionFor
+    >::Allocate(std::forward<UniqueLambdaType>(lambda))->individualTrampoline;
+}
+
+
+inline void callback_extend_lifetime::dispose(){
     isDisposed = true; //called by "the same thread", no protection needed
 }
 
-inline bool callback_extend_lifetime::IsDisposed() const{
+inline bool callback_extend_lifetime::is_disposed() const{
     return isDisposed; //called by "the same thread", no protection needed
 }
 
-template<unsigned reservedCount, class AdditionalOptionalTag, class LambdaType>
-auto callback_from_lambda(LambdaType&& lambda) -> 
-    CoroFork_SupportNamespace::SimpleSignatureFromLambda<LambdaType>*
-{
-    // lambda will be moved to internal block pool
-    return CoroFork_SupportNamespace::Allocator<
+
+template<
+    unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType
+> scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>
+::scoped_callback_holder(UniqueLambdaType&& lambda)
+    : owningBlock(
+        /* lambda will be moved to internal block pool
+        and "auto free" strategy is applied,
+        one shall not allocate nodes manually  */
+        CoroFork_detail::CallbackAllocator<
+            reservedCount,
+            AdditionalOptionalTag,
+            std::remove_reference_t<UniqueLambdaType>,
+            CoroFork_detail::ObtainSimpleNoAutoFreeFunctionFor
+        >::Allocate(std::forward<UniqueLambdaType>(lambda))
+    )
+{}
+
+
+template<
+    unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType
+> scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>
+::~scoped_callback_holder(){
+    using Node = typename CoroFork_detail::CallbackAllocator<
         reservedCount,
         AdditionalOptionalTag,
-        std::remove_reference_t<LambdaType>
-    >::Allocate(std::forward<LambdaType>(lambda));
+        std::remove_reference_t<UniqueLambdaType>,
+        CoroFork_detail::ObtainSimpleNoAutoFreeFunctionFor
+    >::Node;
+    static_cast<Node*>(owningBlock)->Free();
 }
+
+template<
+    unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType
+> scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>
+::scoped_callback_holder(const scoped_callback_holder&& other)
+    : owningBlock(other.owningBlock)
+{
+    other.owningBlock = nullptr; //cleanup other
+}
+    
+template<
+    unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType
+>
+scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>&
+scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>
+::operator=(const scoped_callback_holder&& other){
+    //the destructor of temporary "other" will take care of cleanup
+    std::swap(owningBlock, other.owningBlock);
+}
+
+template<
+    unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType
+>
+scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>::Signature*
+scoped_callback_holder<reservedCount, AdditionalOptionalTag, UniqueLambdaType>
+::Callback() const{
+    using Node = typename CoroFork_detail::CallbackAllocator<
+        reservedCount,
+        AdditionalOptionalTag,
+        std::remove_reference_t<UniqueLambdaType>,
+        CoroFork_detail::ObtainSimpleNoAutoFreeFunctionFor
+    >::Node;
+    //Note: it is expected lambda was attached
+    return static_cast<Node*>(owningBlock)->individualTrampoline;
+}
+
+template<
+    unsigned reservedCount, class AdditionalOptionalTag, class UniqueLambdaType
+>
+auto scoped_callback(UniqueLambdaType&& lambda) ->
+    scoped_callback_holder<
+        reservedCount, AdditionalOptionalTag, UniqueLambdaType
+    >
+{
+    return scoped_callback_holder<
+        reservedCount, AdditionalOptionalTag, UniqueLambdaType
+    >(std::forward<UniqueLambdaType>(lambda));
+}
+
 
 #endif
