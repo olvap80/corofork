@@ -581,7 +581,7 @@ public:
     template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
     invert_subscription_holder(
         const LambdaToSetupFunction& setupFunction ///< receives generated callback
-    ): finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+    ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
                         ::SubscribeSimpleCB(this, setupFunction) ) {}
 
     /// Setup simple generated subscription that returns value
@@ -602,8 +602,15 @@ public:
     invert_subscription_holder(
         const LambdaToSetupFunction& setupFunction, ///< Your setup
         ResultForCallbackFunctionAsValue&& resultForCallbackFunction
-    ): finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
-        ::SubscribeCBReturnsValue(this, setupFunction, resultForCallbackFunction) ) {}
+    ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+            ::SubscribeCBReturnsValue(
+                this,
+                setupFunction,
+                std::forward<ResultForCallbackFunctionAsValue>(
+                    resultForCallbackFunction
+                )
+            )
+        ) {}
 
 
     /// Number of items accumulated by subscription so far
@@ -1005,7 +1012,7 @@ namespace CoroFork_detail{
             // returns cleanup API
             return setupLambda(
                 self->Decorate([=](CallbackArg arg){
-                    self->OnParametersArrived(arg); //what will be returned to coroutine
+                    self->OnArgumentsArrived(arg); //what will be returned to coroutine
                 })
             );
         }
@@ -1048,10 +1055,9 @@ namespace CoroFork_detail{
         ){
             setupLambda(
                 self->Decorate([=](CallbackArg arg){
-                    self->OnParametersArrived(arg); //what will be returned to coroutine
+                    self->OnArgumentsArrived(arg); //what will be returned to coroutine
                 })
             );
-
             // returns cleanup API that does nothing
             return [](){};
         }
@@ -1106,9 +1112,10 @@ namespace CoroFork_detail{
                 "(present value means result is ready immediately)"
             );
 
+            // returns cleanup API
             return setupLambda(
                 self->Decorate([=](CallbackArgs... args){
-                    self->OnParametersArrived(args...); //what will be returned to coroutine
+                    self->OnArgumentsArrived(args...); //what will be returned to coroutine
                 })
             );
         }
@@ -1150,10 +1157,9 @@ namespace CoroFork_detail{
         ){
             setupLambda(
                 self->Decorate([=](CallbackArgs... args){
-                    self->OnParametersArrived(args...); //what will be returned to coroutine
+                    self->OnArgumentsArrived(args...); //what will be returned to coroutine
                 })
             );
-
             // returns cleanup API that does nothing
             return [](){};
         }
@@ -1173,7 +1179,7 @@ namespace CoroFork_detail{
         using FunctionResultType = CallbackRes;
 
 
-        //Invoke setup with resuming function that returns value
+        ///Invoke setup with resuming function that returns value
         template<class AwaitableToPlaceResult, class Value>
         static bool SetupCBReturnsValue(
             AwaitableToPlaceResult* self,
@@ -1197,6 +1203,35 @@ namespace CoroFork_detail{
                         )
                     ](){
                         handle(); //resume the coroutine
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
+            );
+        }
+        ///Invoke setup with subscribing function that returns value
+        template<class AwaitableToPlaceResult, class Value>
+        static auto SubscribeCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            static_assert(
+                std::invocable<OperatorResult>,
+                "Such setup lambda shall return void or invocable\n"
+                "void means no cleanup is needed\n"
+                "invocable is a simple cleanup function to be called on scope exit"
+            );
+            // returns cleanup API
+            return setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](){
+                        self->OnEventHappened();
                         // storedResult is alive as long as capture exists
                         return storedResult;
                     }
@@ -1244,7 +1279,7 @@ namespace CoroFork_detail{
         using FunctionResultType = CallbackRes;
 
 
-        //Invoke setup with resuming function that returns value
+        ///Invoke setup with resuming function that returns value
         template<class AwaitableToPlaceResult, class Value>
         static bool SetupCBReturnsValue(
             AwaitableToPlaceResult* self,
@@ -1267,6 +1302,31 @@ namespace CoroFork_detail{
                 )
             );
             return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult, class Value>
+        static auto SubscribeCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](){
+                        self->OnEventHappened();
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
+            );
+            // returns cleanup API that does nothing
+            return [](){};
         }
 
         //Invoke setup with resuming function that calculates result
@@ -1306,7 +1366,7 @@ namespace CoroFork_detail{
         using FunctionResultType = CallbackRes;
 
 
-        //Invoke setup with resuming function that remembers argument and returns value
+        ///Invoke setup with resuming function that remembers argument and returns value
         template<class AwaitableToPlaceResult, class Value>
         static bool SetupCBReturnsValue(
             AwaitableToPlaceResult* self,
@@ -1337,6 +1397,36 @@ namespace CoroFork_detail{
                     )
                 ),
                 self
+            );
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult, class Value>
+        static auto SubscribeCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            static_assert(
+                std::invocable<OperatorResult>,
+                "Such setup lambda shall return void or invocable\n"
+                "void means no cleanup is needed\n"
+                "invocable is a simple cleanup function to be called on scope exit"
+            );
+            // returns cleanup API
+            return setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](CallbackArg arg){
+                        self->OnArgumentsArrived(arg); 
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
             );
         }
 
@@ -1385,7 +1475,7 @@ namespace CoroFork_detail{
         using FunctionResultType = CallbackRes;
 
 
-        //Invoke setup with resuming function that remembers argument and returns value
+        ///Invoke setup with resuming function that remembers argument and returns value
         template<class AwaitableToPlaceResult, class Value>
         static bool SetupCBReturnsValue(
             AwaitableToPlaceResult* self,
@@ -1409,6 +1499,31 @@ namespace CoroFork_detail{
                 )
             );
             return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult, class Value>
+        static auto SubscribeCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>(
+                            std::forward<Value>(result)
+                        )
+                    ](CallbackArg arg){
+                        self->OnArgumentsArrived(arg);
+                        // storedResult is alive as long as capture exists
+                        return storedResult;
+                    }
+                )
+            );
+            // returns cleanup API that does nothing
+            return [](){};
         }
 
         //Invoke setup with resuming function that remembers argument and calculates result
@@ -1449,7 +1564,7 @@ namespace CoroFork_detail{
         using FunctionResultType = CallbackRes;
 
 
-        //Invoke setup with resuming function that remembers arguments and returns value
+        ///Invoke setup with resuming function that remembers arguments and returns value
         template<class AwaitableToPlaceResult, class Value>
         static bool SetupCBReturnsValue(
             AwaitableToPlaceResult* self,
@@ -1480,6 +1595,36 @@ namespace CoroFork_detail{
                     )
                 ),
                 self
+            );
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult, class Value>
+        static auto SubscribeCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            static_assert(
+                std::same_as<OperatorResult, std::optional<CoResultType>>,
+                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "(present value means result is ready immediately)"
+            );
+
+            // returns cleanup API
+            return setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>( 
+                            std::forward<Value>(result)
+                        )
+                    ](CallbackArgs... args){
+                        self->OnArgumentsArrived(args...); //what will be returned to coroutine
+                        // storedResult is alive as long as capture copy exists
+                        return storedResult;
+                    }
+                )
             );
         }
 
@@ -1528,7 +1673,7 @@ namespace CoroFork_detail{
         using FunctionResultType = CallbackRes;
 
 
-        //Invoke setup with resuming function that remembers arguments and returns value
+        ///Invoke setup with resuming function that remembers arguments and returns value
         template<class AwaitableToPlaceResult, class Value>
         static bool SetupCBReturnsValue(
             AwaitableToPlaceResult* self,
@@ -1552,6 +1697,31 @@ namespace CoroFork_detail{
                 )
             );
             return true; //means stay suspended (this is ok even if already resumed)
+        }
+
+        ///Invoke setup with subscribing function
+        template<class AwaitableToPlaceResult, class Value>
+        static auto SubscribeCBReturnsValue(
+            AwaitableToPlaceResult* self,
+            const LambdaType& setupLambda,
+            Value&& result
+        ){
+            setupLambda(
+                self->Decorate(
+                    [   =,
+                        //captured copy shall be able to exist a for long time
+                        storedResult=std::remove_reference_t<Value>( 
+                            std::forward<Value>(result)
+                        )
+                    ](CallbackArgs... args){
+                        self->OnArgumentsArrived(args...); //what will be returned to coroutine
+                        // storedResult is alive as long as capture copy exists
+                        return storedResult;
+                    }
+                )
+            );
+            // returns cleanup API that does nothing
+            return [](){};
         }
 
         //Invoke setup with resuming function that remembers argument and calculates result
