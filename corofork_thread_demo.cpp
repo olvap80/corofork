@@ -16,8 +16,11 @@ int main(){
     std::cout<<"Testing coroutines, main enter in "<<std::this_thread::get_id()<<"\n"<<std::endl;
 
     /* thats definitely for coroutine going in thread demo purposes
-       to show how coroutine switches to other thread
-       (std::async is better in current case, but what is just for sample) */
+       just to show how coroutine switches to other thread
+       (std::async is for case of "just thread", but what is just for demo purposes)
+       
+       you cal also avoid "std::promise<void> p;" and related stuff
+       by using corosync instead of corofork))  */
     std::promise<void> p;
 
     corofork(&){ //capturing by & is safe because outer waits for completion
