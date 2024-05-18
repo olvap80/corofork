@@ -179,34 +179,51 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 /// Start a coroutine "inline" (body follows in {})
 /** Macro creates a new coroutine optionally capturing parameters  
  * The way how variables are captured is determined by the macro parameters
- * one can provide =, &, or named captures as well */
+ * one can provide =, &, or named captures as well.
+ * "Forked" coroutine starts execution immediately in current thread,
+ * but can be suspended and resumed in other threqad later.
+ * The "fork" suffix means coroutine lifetime and execution
+ * is independent from the caller thread (caller thread is not blocked).
+ * Be aware: mutexes shall not be crossed by co_await, because
+ * one can resune corourine from different thread, but mutex
+ * is sill owned by previous thread! */
 #define corofork(...) \
     CoroFork_detail::tagTieWithOverloadedOperator ->* \
     /* Note: lambda is not called below, operator->* does the stuff */ \
     [__VA_ARGS__]()-> \
         CoroFork_detail::CoroFork /* Lambda body follows here in {} */
 
-/// Run a coroutine "inline", and block until coroutine completes
+/// Run a coroutine "inline" (synchronously), blocks until coroutine completes
 /** The same as above, but now caller thread will not continue independently,
- * and will block until coroutine completes,
+ * and will block until coroutine completes (probablu in other threads),
  * this means coroutine executes in "their" threads, but finally control
- * return to this one.
+ * return to this one onve coroutine completed.
+ * The "sync" suffix means coroutine lifetime and execution
+ * is tied to the caller thread (initial caller thread is blocked).
+ * 
  * One can do 
- *      co_await back_to_thread 
- * to force execution in the thread that called corosync 
- * this is especially useful for the case if long computation
+ *      co_await back_to_thread;
+ * to force this coroutine execution flow to continue in the initial thread
+ * that called the corosync marco.
+ * This is especially useful for the case if long computation
  * is needed "here" but "their" callback must return immediately,
- * in this way we can reuse existing thread for running the computation,
- * see samples above
+ * in this way we can reuse existing thread for running the computation
+ * in the coroutine, see samples above.
+ * 
  * Exceptions are forwarded from "other thread" to this one
  * (so corosync will rethrow all exceptions being trown in
- *  any "other thread" driving the coroutine) */
+ * any "other thread" driving the coroutine to the caller thread)
+ * Be aware: mutexes shall not be crossed by co_await, because
+ * one can resune corourine from different thread, but mutex
+ * is sill owned by previous thread! */
 #define corosync(...) \
     CoroFork_detail::tagTieWithSyncOverloadedOperator ->* \
     /* Note: lambda is not called below, operator->* does the stuff */ \
     [__VA_ARGS__]( \
         [[maybe_unused]] \
-            CoroFork_detail::AwaitableBackToThread back_to_thread \
+            CoroFork_detail::CoroSync::promise_type:: \
+                SharedState::BackToThreadAwaitable \
+                    back_to_thread \
     )-> \
         CoroFork_detail::CoroSync /* Lambda body follows here in {} */
 
@@ -1017,7 +1034,7 @@ namespace CoroFork_detail{
         started.myPromise->capturingFunction = std::move(capture);
 
         /* Here coroutine is resumed from the current thread,
-        all actions will happen immediately here */
+        all actions will happen immediately in this thread */
         std::coroutine_handle<promise_type>::from_promise(*started.myPromise).resume();
 
         /*once we are here this means coroutine eiter suspended or executes
@@ -1106,15 +1123,40 @@ namespace CoroFork_detail{
             /// Used for waiting for coroutine to finish
             std::condition_variable waitForPromise;
 
+            enum class State{
+                Running,
+                FinishedNormally,
+                FinishedWithException,
+                GoBackToThread
+            } state = State::Running;
+
+            class BackToThreadAwaitable{
+            public:
+                BackToThreadAwaitable(SharedState* sharedStateToUse)
+                    : sharedState(sharedStateToUse) {}
+
+                /// Always cause coroutine to suspend 
+                bool await_ready() const noexcept{ return false; }
+
+                /// Cause execution to continue in the initial thread
+                void await_suspend(std::coroutine_handle<> handle){
+                    std::lock_guard lock(sharedState->protectPromise);
+                    sharedState->state = State::GoBackToThread;
+                    sharedState->waitForPromise.notify_one();
+                }
+
+                void await_resume() const noexcept{}
+            private:
+                SharedState* const sharedState;
+            };
+
             /// Exception to be propagated from corosync
             std::exception_ptr exception;
-            /// Mark coroutine as finished
-            bool finishedNormally = false;
 
             /// Mark coroutine as finished (will not resume)
             void return_void() noexcept {
                 std::lock_guard lock(protectPromise);
-                finishedNormally = true;
+                state = State::FinishedNormally;
                 waitForPromise.notify_one();
             }
 
@@ -1122,11 +1164,12 @@ namespace CoroFork_detail{
             void unhandled_exception() noexcept {
                 //propagate exception to the future (to be propagated from corosync)
                 std::lock_guard lock(protectPromise);
+                state = State::FinishedWithException;
                 exception = std::current_exception();
                 waitForPromise.notify_one();
             }
         };
-        std::shared_ptr<SharedState> sharedState = std::make_shared<SharedState>();
+        std::shared_ptr<SharedState> sharedState;
 
         /// Mark coroutine as finished
         void return_void() noexcept {
@@ -1151,37 +1194,54 @@ namespace CoroFork_detail{
     
     template<class Lambda>
     void CoroSync::Start(Lambda&& lambda){
-        // Capture is not needed here as lambda will exist as long as coroutine is running
-        CoroSync started = lambda();
+        /* Storing lambda in capture is not needed here 
+          as lambda will exist as long as coroutine is running
+          due to synchronization */
 
+        //Eiher promise or Start API can use sharedState longer
+        auto sharedState = std::make_shared<CoroSync::promise_type::SharedState>();
+
+        //this will create corresponding promise and coroutine (in suspended state) 
+        CoroSync started = lambda(
+            //coroutine will be able to go back to the initial thread
+            CoroSync::promise_type::SharedState::BackToThreadAwaitable(sharedState.get()) 
+        );
+
+        //ensure sharedState is alive as long as coroutine is running
+        started.myPromise->sharedState = sharedState;
+
+        //handle to the coroutine
         auto handle = std::coroutine_handle<promise_type>::from_promise(*started.myPromise);
-        auto sharedState = started.myPromise->sharedState;
 
-        do{
+        for( ;; ){
             /* Here coroutine is resumed from the current thread,
-            all actions will happen immediately here */
+            all actions will happen immediately in this thread */
             handle.resume();
 
-            /*once we are here this means coroutine eiter suspended or executes
-                in some other thread, or it is already finished
-                (but is any case sharedState is still alive,
-                eiter other thread finished it or this one) */
+            /*once we are here this means coroutine eiter suspended or
+            executes in some other thread, or it is already finished and meybe destroyed,
+            (but is any case sharedState is still alive,
+            eiter other thread is finished it or this one marks for end) */
 
-            std::lock_guard lock(sharedState->protectPromise);
-            for( ;; ){
-                if( sharedState->finishedNormally ){
-                    //normal exit, everything will cleanup automatically
-                    return;
+            std::unique_lock lock(sharedState->protectPromise);
+            while(
+                    sharedState->state
+                !=  CoroSync::promise_type::SharedState::State::GoBackToThread
+            ){
+                switch( sharedState->state ){
+                    case CoroSync::promise_type::SharedState::State::FinishedNormally:
+                        //normal exit, will cleanup sharedState automatically
+                        return;
+                    case CoroSync::promise_type::SharedState::State::FinishedWithException:
+                        //normal exit, also will cleanup sharedState automatically
+                        std::rethrow_exception(sharedState->exception);
                 }
-                if( myPromise->exception ){
-                    //normal exit, also will cleanup automatically
-                    std::rethrow_exception(myPromise->exception);
-                }
-
                 //wait for coroutine to "change something"
-                myPromise->waitForPromise.wait(myPromise->protectPromise);
+                sharedState->waitForPromise.wait(lock);
             }
-        } while( !handle.done() );          
+            // Prevent GoBackToThread until coroutine explicitly awaits back_to_thread
+            sharedState->state = CoroSync::promise_type::SharedState::State::Running;
+        } // loop for resuming coroutine   
     }
 
     ///Helper type to trigger operator ->* for corosync macro

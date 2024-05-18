@@ -21,8 +21,12 @@ if(MSVC)
     add_link_options("/DEBUG:FULL")
 endif()
 
-# While in VSCode click target in status bar to select the one to run
-add_executable(corofork_all_demo corofork_all_demo.cpp)
-add_executable(corofork_thread_demo corofork_thread_demo.cpp)
-add_executable(corofork_invert_subscription_demo corofork_invert_subscription_demo.cpp)
-add_executable(corofork_multimpe_threads_demo corofork_multimpe_threads_demo.cpp)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+
+# While in VSCode click "Activity Bar" on the left, then "CMake" 
+# to see the list of targets and select the one to run.
+# Find Build/Debug/Run buttons in the status bar below
+add_executable(all_invert_function_and_callback Demo/all_invert_function_and_callback.cpp)
+add_executable(go_thread_and_back Demo/go_thread_and_back.cpp)
+add_executable(invert_subscription Demo/invert_subscription.cpp)
+add_executable(multimpe_threads_invert_subscription Demo/multimpe_threads_invert_subscription.cpp)
