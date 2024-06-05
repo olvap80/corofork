@@ -73,8 +73,14 @@
         "future": "cpp",
         "resumable": "cpp",
         "deque": "cpp",
-        "queue": "cpp"
+        "queue": "cpp",
+        "fstream": "cpp"
     },
+    "cmake.configureSettings": {
+        "CMAKE_CXX_STANDARD": "20"
+    },
+    "C_Cpp.default.cppStandard": "c++20",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
     "cSpell.words": [
         "corofork", "corosync"
     ]

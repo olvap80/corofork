@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(corofork_demo LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
 
 # While in VSCode, use recommended extentions from extensions.json,
 # they add context menus and buttons into status bar. 
@@ -11,7 +12,6 @@ project(corofork_demo LANGUAGES CXX)
 # See also https://github.com/microsoft/vscode-cmake-tools/blob/58a1962bf47dbd53b4798734a72192f7de12512b/docs/debug-launch.md
 message("Generated with config types: ${CMAKE_CONFIGURATION_TYPES}")
 
-set(CMAKE_CXX_STANDARD 20)
 
 if(MSVC)
     # Remember _HAS_STATIC_RTTI=0 shall also do /GR-

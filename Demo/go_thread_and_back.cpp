@@ -1,6 +1,7 @@
-/** @file corofork_thread_demo.h
+/** @file go_thread_and_back.h
     @brief  Demonstrate how callback shall issue resumer API
-            to drive the coroutine.  
+            to drive the coroutine, and how coroutine can switch
+            to another thread and back to the original one. 
 
     Watch for console outputs and thread IDs,
     printouts here are for illustration purposes ))
@@ -25,7 +26,9 @@ int main(){
         // it is not necessary to use corofork/corosync to have invert_function))
         co_await invert_function([](std::function<void()> resumer){
             std::cout<<"before creating thread in "<<std::this_thread::get_id()<<std::endl;
-            // Note: resumer will continue execution of the coroutine in thread
+            /* Note: resumer will continue execution of the coroutine in thread,
+               here we use use std::thread just for demo purposes,
+               but that could be any onter API, loke OS callbacks, etc */
             std::thread(resumer).detach(); // the only necessary line inside  
             std::cout<<"after creating thread in "<<std::this_thread::get_id()<<std::endl;
         });

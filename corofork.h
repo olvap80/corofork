@@ -247,7 +247,7 @@ namespace CoroFork_detail{
 
 
     //__________________________________________________________________________
-    // Forward declare awaitables
+    // Forward declare awaitables and holders
 
     template<class Decorator, class CoResult, class SetupLambdaType>
     class AwaitableSimpleCB;
@@ -259,6 +259,10 @@ namespace CoroFork_detail{
     template<class Decorator, class CoResult,
         class SetupLambdaType, class CallbackToCallFromGeneratedCallbackType>
     class AwaitableGeneratedCBReturnsResultOfCall;
+
+    /// Internal class to hold subscription as long as instance exists
+    template<class Decorator, class AwaitedType>
+    class InvertSubscriptionHolder;
 
     //__________________________________________________________________________
     // Helpers for callback_from_lambda
@@ -540,6 +544,8 @@ auto invert_function(
 }
 
 /// Same as above, but generated callback returns value returned by functionToObtainResult
+/** Remember here coroutine is resumed directly from the callback, thus
+ * functionToObtainResultForCallback is issued once we await for "somenting else" */
 template<
     CoroForkLambdaToSetupFunction LambdaToSetupFunction, ///< Your setup
     std::invocable FunctionToObtainResult
@@ -603,7 +609,8 @@ auto invert_callback(
 /// Same as above, but generated callback has a return value
 /** In addition to the above logic Here the return value for
  * the generated callback can be provided.
- * See samples above for illustration. */
+ * See samples above for illustration.
+ * Remember here coroutine is resumed directly from the callback */
 template<
     std::size_t maxCallbacksCount, ///< Specify callback count per lambda
     CoroForkLambdaToSetupCallback LambdaToSetupCallback, ///< Your setup
@@ -638,6 +645,8 @@ auto invert_callback(
 }
 
 /// Same as above, but generated callback returns value returned by functionToObtainResultForCallback
+/** Remember here coroutine is resumed directly from the callback, thus
+ * functionToObtainResultForCallback is issued once we await for "somenting else" */
 template<
     std::size_t maxCallbacksCount, ///< Specify callback count per lambda
     CoroForkLambdaToSetupCallback LambdaToSetupCallback, ///< Your setup
@@ -676,178 +685,7 @@ auto invert_callback(
 //______________________________________________________________________________
 // Turning subscription to awaitable for function
 
-
 namespace CoroFork_detail{
-
-    /// On subscription as long as instance exists
-    template<class Decorator, class AwaitedType>
-    class InvertSubscriptionHolder: public Decorator{
-    public:
-        /// Setup simple generated subscription that returns nothing
-        /** See corresponding invert_subscription below */
-        template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
-        InvertSubscriptionHolder(
-            const LambdaToSetupFunction& setupFunction ///< receives generated callback
-        ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
-                            ::SubscribeSimpleCB(this, setupFunction)
-            ) {}
-
-        /// Setup simple generated subscription that returns value
-        /** See corresponding invert_subscription below */
-        template<
-            CoroForkLambdaToSetupFunction LambdaToSetupFunction,
-            class ResultForCallbackFunctionAsValue
-        >
-        requires    
-            std::convertible_to<
-                std::remove_cvref_t<ResultForCallbackFunctionAsValue>,
-                std::remove_cvref_t<
-                    typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
-                >
-            >
-        InvertSubscriptionHolder(
-            const LambdaToSetupFunction& setupFunction, ///< Your setup
-            ResultForCallbackFunctionAsValue&& resultForCallbackFunction
-        ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
-                ::SubscribeCBReturnsValue(
-                    this,
-                    setupFunction,
-                    std::forward<ResultForCallbackFunctionAsValue>(
-                        resultForCallbackFunction
-                    )
-                )
-            ) {}
-        /// Issue cleanup procedure if it was provided
-        ~InvertSubscriptionHolder(){
-            finalCleanup(); //safe, "do nothing" is placed here if there is no cleanup
-        }
-
-        /// Number of items accumulated by this subscription so far
-        std::size_t count() const;
-
-        // exists only in one place (but takes advantage of RVO!)
-        InvertSubscriptionHolder(const InvertSubscriptionHolder&) = delete;
-        InvertSubscriptionHolder& operator=(const InvertSubscriptionHolder&) = delete;
-
-
-        /// Awaitable being used for obtaining subscription data
-        class awaitable{
-        public:
-            // can move, but cannot copy
-            awaitable(const awaitable&&);
-            awaitable& operator=(const awaitable&&);
-            awaitable(const awaitable&) = delete;
-            awaitable& operator=(const awaitable&) = delete;
-
-            /// Awaitable is ready once result is available
-            /** \returns true if result is already there */
-            bool await_ready() noexcept{
-                // we still own the lock over holder->protectEventsQueue 
-                if( holder->eventsQueue.empty() ){
-                    /* no items so far, need to suspend, lock is still here
-                       we will enter into await_suspend owning the lock */
-                    return false;
-                }
-                //extract one item from the queue to result
-                result.emplace( std::move(holder->eventsQueue.front()) );
-                holder->eventsQueue.pop();
-
-                lock.unlock(); //no need to lock anymore (this awaitable is "already used")
-                
-                /* coroutine will pick up the result via await_resume
-                  await_suspend is not called in this case */
-                return true;
-            }
-
-            /// Suspend until result is available
-            /** \returns false if result is already there
-             *           true if we need to suspend */
-            void await_suspend(std::coroutine_handle<> handle){
-                // we still own lock over holder->protectEventsQueue
-                this->handle = handle; //will be used by OnArgumentsArrived
-                holder->whoAwaitsNow = this; //sign of "write result directly to me"
-                
-                lock.unlock(); //it is allowed for other threads to push arguments
-            }
-
-            /// Get the result once it is available
-            AwaitedType await_resume(){
-                /* No need to lock here we own the result
-                   we are sure this API is called once coroutine continues */
-                return std::move(*result);
-            }
-
-        private:
-            // Instaces are created only by InvertSubscriptionHolder
-            friend class InvertSubscriptionHolder;
-            /// Constructor for awaitable tied to InvertSubscriptionHolder
-            awaitable(InvertSubscriptionHolder* correspondingHolder)
-                : holder(correspondingHolder)
-                , lock(correspondingHolder->protectEventsQueue)
-                {}
-
-            /// Ensure lock os obatined from the moment we are created
-            std::unique_lock<std::mutex> lock;
-
-            /// Subscription holder we use in awaitable
-            InvertSubscriptionHolder* holder;
-
-            /// What to resume once value arrives (used by InvertSubscriptionHolder)
-            /** For scenario once there were no items */
-            std::coroutine_handle<> handle;
-
-            /// result to be returned once it is available
-            /** Storing value here prevents extra locking */
-            std::optional<AwaitedType> result;
-        };
-
-        /// Allow the same InvertSubscriptionHolder to be awaited multiple times
-        awaitable operator co_await(){
-            return awaitable(this);
-        }
-
-        /// To be called from "somewhere else" once result is ready
-        template<class... CallbackArgs>
-        void OnArgumentsArrived(CallbackArgs&&... args){
-            std::coroutine_handle<> handle;
-            {
-                std::lock_guard lock(protectEventsQueue);
-                if( whoAwaitsNow ){
-                    /* no need to store the result in the queue
-                       place the result directly to the one who waits */
-                    whoAwaitsNow->result.emplace( std::forward<CallbackArgs>(args)... );
-                    //will resume the one who waits right now
-                    handle = std::move(whoAwaitsNow->handle);
-                    whoAwaitsNow = nullptr;
-                }
-                else{
-                    //else means no one is waiting right now, save "for later"
-                    eventsQueue.emplace( std::forward<CallbackArgs>(args)... );
-                }
-            }
-            /* No need to lock here, we are sure this API is called once
-               result is ready and threre in only one consumer (the coroutine).
-               Coroutine co_alwait happen sequentially, so we can resume
-               even if other thread is also pushing arguments */
-            if( handle ){
-                //doing this outside of lock to avoid deadlocks
-                handle.resume();
-            }
-        }
-    private:
-        /// Called once InvertSubscriptionHolder goes out of scope 
-        std::function< void() > finalCleanup;
-
-        /// Awaitable being used "right now" for obtaining subscription data
-        awaitable* whoAwaitsNow = nullptr;
-
-        /// Events that are available so far
-        std::queue<AwaitedType> eventsQueue;
-
-        /// Protect operations with eventsQueue
-        /** Subscription data may arrive from different threads */
-        std::mutex protectEventsQueue;
-    };
 
 } //namespace CoroFork_detail
 
@@ -862,7 +700,9 @@ namespace CoroFork_detail{
  * The setupFunction can optionally return "the unsubscription API",
  * to be automatically invoked once corresponding invert_subscription_holder 
  * goes out of scope. 
- * See samples above for illustration */
+ * See samples above for illustration.
+ * (Remember here "inverted" subscription callback returns result immediately once issued
+ *  and not when subscription is actually awaited) */
 template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
 auto invert_subscription(
     const LambdaToSetupFunction& setupFunction ///< receives generated callback
@@ -2261,7 +2101,7 @@ namespace CoroFork_detail{
         }
         
         /// The value, that goes to coroutine as a result of co_await
-        CoResult await_resume() const noexcept {
+        CoResult await_resume() noexcept {
             return std::move(*result);
         }
 
@@ -2359,7 +2199,7 @@ namespace CoroFork_detail{
         }
         
         /// The value, that goes to coroutine as a result of co_await
-        CoResult await_resume() const noexcept {
+        CoResult await_resume() noexcept {
             return std::move(*result);
         }
 
@@ -2482,7 +2322,7 @@ namespace CoroFork_detail{
         }
         
         /// The value, that goes to coroutine as a result of co_await
-        CoResult await_resume() const noexcept {
+        CoResult await_resume() noexcept {
             return std::move(*result);
         }
 
@@ -3014,6 +2854,373 @@ namespace CoroFork_detail{
         /// Ensures callback will be valid as long as ToPlainC exists
         KeepAlive keepAlive{nullptr, [](void*){}};
     };
+
+
+    //__________________________________________________________________________
+    //##########################################################################
+    // Support for invert_subscription
+
+    /// Internal class to hold subscription as long as instance exists
+    template<class Decorator, class AwaitedType>
+    class InvertSubscriptionHolder: public Decorator{
+    public:
+        /// Setup simple generated subscription that returns nothing
+        /** See corresponding invert_subscription */
+        template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
+        InvertSubscriptionHolder(
+            const LambdaToSetupFunction& setupFunction ///< receives generated callback
+        ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+                            ::SubscribeSimpleCB(this, setupFunction)
+            ) {}
+
+        /// Setup simple generated subscription that returns value
+        /** See corresponding invert_subscription,
+         * (Remember here callback returns result immediately once issued
+         *  and not when value is actually awaited) */
+        template<
+            CoroForkLambdaToSetupFunction LambdaToSetupFunction,
+            class ResultForCallbackFunctionAsValue
+        >
+        requires
+            std::convertible_to<
+                std::remove_cvref_t<ResultForCallbackFunctionAsValue>,
+                std::remove_cvref_t<
+                    typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+                >
+            >
+        InvertSubscriptionHolder(
+            const LambdaToSetupFunction& setupFunction, ///< Your setup
+            ResultForCallbackFunctionAsValue&& resultForCallbackFunction
+        ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+                ::SubscribeCBReturnsValue(
+                    this,
+                    setupFunction,
+                    std::forward<ResultForCallbackFunctionAsValue>(
+                        resultForCallbackFunction
+                    )
+                )
+            ) {}
+
+        /// Issue cleanup procedure if it was provided
+        ~InvertSubscriptionHolder(){
+            finalCleanup(); //safe, "do nothing" is placed here if there is no cleanup
+        }
+
+        /// Number of items accumulated by this subscription so far
+        std::size_t count() const{
+            //this is not called simultaneously with await))
+            std::lock_guard lockEventsQueue(protectEventsQueue);
+            return eventsQueue.size();
+        }
+
+        // exists only in one place (but takes advantage of RVO!)
+        InvertSubscriptionHolder(const InvertSubscriptionHolder&) = delete;
+        InvertSubscriptionHolder& operator=(const InvertSubscriptionHolder&) = delete;
+
+
+        /// Awaitable being used for obtaining subscription data
+        class awaitable{
+        public:
+            // can move, but cannot copy
+            awaitable(const awaitable&&);
+            awaitable& operator=(const awaitable&&);
+            awaitable(const awaitable&) = delete;
+            awaitable& operator=(const awaitable&) = delete;
+
+            /// Awaitable is ready once result is available from the queue
+            /** \returns true if result is already there
+             *   false if we need to suspend (callback was not issued yet) */
+            bool await_ready() noexcept{
+                // we still own the lock over holder->protectEventsQueue 
+                if( holder->eventsQueue.empty() ){
+                    /* no items so far, need to suspend, lock is still here
+                       we will enter into await_suspend owning the lock */
+                    return false;
+                }
+                //extract one item from the queue to result
+                result.emplace( std::move(holder->eventsQueue.front()) );
+                holder->eventsQueue.pop();
+
+                //no need to lock anymore (this awaitable is "already used")
+                lockEventsQueue.unlock();
+                
+                /* coroutine will now pick up the result via await_resume
+                  await_suspend is not called in this case
+                  (we do only await_resume that returns ready to use result) */
+                return true;
+            }
+
+            /// Suspend until result is available
+            void await_suspend(std::coroutine_handle<> handle){
+                /* we still own the lock over holder->protectEventsQueue
+                   so result was not placed here for sure! */
+                this->handle = handle; //will be used by OnArgumentsArrived
+                holder->whoAwaitsNow = this; //sign of "write result directly to me"
+                
+                //now it is allowed for other threads to push arguments to the queue
+                lockEventsQueue.unlock();
+            }
+
+            /// Get the result once it is available
+            AwaitedType await_resume() noexcept{
+                /* No need to lock here we own the result
+                   we are sure this API is called once coroutine continues */
+                return std::move(*result);
+            }
+
+        private:
+            // Instaces are created only by InvertSubscriptionHolder
+            friend class InvertSubscriptionHolder;
+            /// Constructor for awaitable tied to InvertSubscriptionHolder
+            awaitable(InvertSubscriptionHolder* correspondingHolder)
+                : holder(correspondingHolder)
+                , lockEventsQueue(correspondingHolder->protectEventsQueue)
+                {}
+
+            /// Ensure lock os obatined from the moment we are created
+            std::unique_lock<std::mutex> lockEventsQueue;
+
+            /// Subscription holder we use in awaitable
+            InvertSubscriptionHolder* holder;
+
+            /// What to resume once value arrives (used by InvertSubscriptionHolder)
+            /** For scenario once there were no items */
+            std::coroutine_handle<> handle;
+
+            /// result to be returned once it is available
+            /** Storing value here prevents extra locking */
+            std::optional<AwaitedType> result;
+
+            /// Called once result is available, but not under lock!
+            void OnResultReady(){
+                handle.resume();
+            }
+        };
+
+        /// Allow the same InvertSubscriptionHolder to be awaited multiple times
+        awaitable operator co_await(){
+            return awaitable(this);
+        }
+
+        /// To be called from "somewhere else" once result is ready
+        template<class... CallbackArgs>
+        void OnArgumentsArrived(CallbackArgs&&... args){
+            awaitable* whoHasToBeResumed = nullptr;
+            {
+                std::lock_guard lockEventsQueue(protectEventsQueue);
+                if( whoAwaitsNow ){
+                    //will resume the one who waits right now
+                    whoHasToBeResumed = whoAwaitsNow;
+                    /* no need to store the result in the queue
+                       place the result directly to the one who waits */
+                    whoHasToBeResumed->result.emplace( std::forward<CallbackArgs>(args)... );
+                    
+                    //that awaitable is "already used"
+                    whoAwaitsNow = nullptr;
+                }
+                else{
+                    //else means no one is waiting right now, save "for later"
+                    eventsQueue.emplace( std::forward<CallbackArgs>(args)... );
+                }
+            }
+            /* No need to lock here, we are sure this API is called once
+               result is ready and threre is only one consumer (the coroutine).
+               Coroutine co_alwait happen sequentially, so we can resume
+               even if other thread is also pushing arguments */
+            if( whoHasToBeResumed ){
+                //doing this outside of lock to avoid deadlocks
+                whoHasToBeResumed->OnResultReady();
+            }
+        }
+    private:
+        /// Called once InvertSubscriptionHolder goes out of scope 
+        std::function< void() > finalCleanup;
+
+        /// Awaitable being used "right now" for obtaining subscription data
+        awaitable* whoAwaitsNow = nullptr;
+
+        /// Events that are available so far
+        std::queue<AwaitedType> eventsQueue;
+
+        /// Protect operations with eventsQueue
+        /** Subscription data may arrive from different threads */
+        std::mutex protectEventsQueue;
+    };
+
+
+    /// Hold subscription as long as instance exists (void specialization)
+    template<class Decorator>
+    class InvertSubscriptionHolder<Decorator, void>: public Decorator{
+    public:
+        /// Setup simple generated subscription that returns nothing
+        /** See corresponding invert_subscription */
+        template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
+        InvertSubscriptionHolder(
+            const LambdaToSetupFunction& setupFunction ///< receives generated callback
+        ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+                            ::SubscribeSimpleCB(this, setupFunction)
+            ) {}
+
+        /// Setup simple generated subscription that returns value
+        /** See corresponding invert_subscription,
+         * (Remember here callback returns result immediately once issued
+         *  and not when value is actually awaited) */
+        template<
+            CoroForkLambdaToSetupFunction LambdaToSetupFunction,
+            class ResultForCallbackFunctionAsValue
+        >
+        requires
+            std::convertible_to<
+                std::remove_cvref_t<ResultForCallbackFunctionAsValue>,
+                std::remove_cvref_t<
+                    typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::FunctionResultType
+                >
+            >
+        InvertSubscriptionHolder(
+            const LambdaToSetupFunction& setupFunction, ///< Your setup
+            ResultForCallbackFunctionAsValue&& resultForCallbackFunction
+        ):  finalCleanup( CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>
+                ::SubscribeCBReturnsValue(
+                    this,
+                    setupFunction,
+                    std::forward<ResultForCallbackFunctionAsValue>(
+                        resultForCallbackFunction
+                    )
+                )
+            ) {}
+
+        /// Issue cleanup procedure if it was provided
+        ~InvertSubscriptionHolder(){
+            finalCleanup(); //safe, "do nothing" is placed here if there is no cleanup
+        }
+
+        /// Number of events accumulated by this subscription so far
+        std::size_t count() const{
+            //this is not called simultaneously with await))
+            std::lock_guard lockEvents(protectEvents);
+            return eventsCount;
+        }
+
+        // exists only in one place (but takes advantage of RVO!)
+        InvertSubscriptionHolder(const InvertSubscriptionHolder&) = delete;
+        InvertSubscriptionHolder& operator=(const InvertSubscriptionHolder&) = delete;
+
+
+        /// Awaitable being used for obtaining subscription data
+        class awaitable{
+        public:
+            // can move, but cannot copy
+            awaitable(const awaitable&&);
+            awaitable& operator=(const awaitable&&);
+            awaitable(const awaitable&) = delete;
+            awaitable& operator=(const awaitable&) = delete;
+
+            /// Awaitable is ready once callback was already issued
+            /** \returns true if callback was already issued
+             *   false if we need to suspend (callback was not issued yet) */
+            bool await_ready() noexcept{
+                // we still own the lock over holder->protectEventsQueue 
+                if( !holder->eventsCount ){
+                    /* no events so far, need to suspend, lock is still here
+                       we will enter into await_suspend owning the lock */
+                    return false;
+                }
+                //one more event is consumed 
+                --holder->eventsCount;
+
+                //no need to lock anymore (this awaitable is "already used")
+                lockEvents.unlock();
+                
+                /* coroutine can continue execution right now
+                  await_suspend is not called in this case */
+                return true;
+            }
+
+            /// Suspend until callback is issued
+            void await_suspend(std::coroutine_handle<> handle){
+                /* we still own the lock over holder->protectEventsQueue
+                   so callback did not increment eventsCount here for sure! */
+                this->handle = handle; //will be used by OnEventHappened
+                holder->whoAwaitsNow = this; //sign of "resume me directly"
+                
+                //now it is allowed for other threads to push arguments
+                lockEvents.unlock();
+            }
+
+            /// Does nothing but must be formally present, to make C++20 happy
+            constexpr void await_resume() const noexcept{}
+
+        private:
+            // Instaces are created only by InvertSubscriptionHolder
+            friend class InvertSubscriptionHolder;
+            /// Constructor for awaitable tied to InvertSubscriptionHolder
+            awaitable(InvertSubscriptionHolder* correspondingHolder)
+                : holder(correspondingHolder)
+                , lockEvents(correspondingHolder->protectEvents)
+                {}
+
+            /// Ensure lock os obatined from the moment we are created
+            std::unique_lock<std::mutex> lockEvents;
+
+            /// Subscription holder we use in awaitable
+            InvertSubscriptionHolder* holder;
+
+            /// What to resume once value arrives (used by InvertSubscriptionHolder)
+            /** For scenario once there were no items */
+            std::coroutine_handle<> handle;
+
+            /// Called once callback was issued, but not under lock!
+            void OnEventHappened(){
+                handle.resume();
+            }
+        };
+
+        /// Allow the same InvertSubscriptionHolder to be awaited multiple times
+        awaitable operator co_await(){
+            return awaitable(this);
+        }
+
+        /// To be called from "somewhere else" once callback is issued
+        template<class... CallbackArgs>
+        void OnEventHappened(CallbackArgs&&... args){
+            awaitable* whoHasToBeResumed = nullptr;
+            {
+                std::lock_guard lockEventsQueue(protectEvents);
+                if( whoAwaitsNow ){
+                    //will resume the one who waits right now
+                    whoHasToBeResumed = whoAwaitsNow;
+                    //that awaitable is "already used"
+                    whoAwaitsNow = nullptr;
+                }
+                else{
+                    //else means no one is waiting right now, save "for later"
+                    ++eventsCount;
+                }
+            }
+            /* No need to lock here, we are sure this API is called once
+               callbach happened and threre is only one consumer (the coroutine).
+               Coroutine co_alwait happen sequentially, so we can resume
+               even if other thread is also pushing arguments */
+            if( whoHasToBeResumed ){
+                //doing this outside of lock to avoid deadlocks
+                whoHasToBeResumed->OnEventHappened();
+            }
+        }
+    private:
+        /// Called once InvertSubscriptionHolder goes out of scope 
+        std::function< void() > finalCleanup;
+
+        /// Awaitable being used "right now" for obtaining subscription data
+        awaitable* whoAwaitsNow = nullptr;
+
+        /// Events that are available so far
+        unsigned eventsCount = 0;
+
+        /// Protect operations with eventsQueue
+        /** Subscription data may arrive from different threads */
+        std::mutex protectEvents;
+    };
+
 } //namespace CoroFork_detail
 
 
