@@ -746,19 +746,19 @@ int main(){
 
 #if 1
 
-    /**
+    /** Subscription design, see also invert_subscription.cpp 
     Q:  When setup happens?
     A:  buffered can setup immediately, callbacks will accumulate;
         unbuffered also can happen immediately, callbacks will delay (DRAWBACK)
     
-    Q:  What if source provides other call while previous is not completed?
+    Q:  What if source provides other call while previous is not yet completed?
     A:  buffered shall place them it into buffer;
         unbuffered shall cause the source to stall (DRAWBACK)
 
     Q:  What about "awaiting for something else"
     A:  buffered can await, callbacks will accumulate;
         unbuffered will cause source to stall 
-        while awaiting for "something else"
+        while coroutine is awaiting for "something else"
         (probably for indefinite time, DRAWBACK)
 
     Q:  How callback returns a value?
@@ -768,7 +768,7 @@ int main(){
         (but likely nobody will use that feature, just abandon it)
 
     The final decision is to make calls to subscription to be accumulated,
-    await on subscription shall extract item from the buffer
+    await on subscription shall extract item from the buffer.
     
     
     {

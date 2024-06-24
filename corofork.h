@@ -734,6 +734,7 @@ auto invert_subscription(
 ){
     //takes advantage of RVO here
     return CoroFork_detail::InvertSubscriptionHolder<
+        typename CoroFork_detail::TheSame,
         typename CoroFork_detail::ExtractFromLambda<LambdaToSetupFunction>::CoResultType
     >(
         setupFunction, 
@@ -1244,7 +1245,7 @@ namespace CoroFork_detail{
         ){
             static_assert(
                 std::same_as<OperatorResult, std::optional<CallbackArg>>,
-                "Call to lambda shall return void of std::optional<CallbackArg>\n"
+                "Call to lambda shall return void or std::optional<CallbackArg>\n"
                 "(present value means result is ready immediately)"
             );
 
@@ -1346,7 +1347,7 @@ namespace CoroFork_detail{
         ){
             static_assert(
                 std::same_as<OperatorResult, std::optional<CoResultType>>,
-                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "Call to lambda shall return void or std::optional<std::tuple<CallbackArgs...>>\n"
                 "(present value means result is ready immediately)"
             );
 
@@ -1371,7 +1372,7 @@ namespace CoroFork_detail{
         ){
             static_assert(
                 std::same_as<OperatorResult, std::optional<CoResultType>>,
-                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "Call to lambda shall return void or std::optional<std::tuple<CallbackArgs...>>\n"
                 "(present value means result is ready immediately)"
             );
 
@@ -1837,7 +1838,7 @@ namespace CoroFork_detail{
         ){
             static_assert(
                 std::same_as< OperatorResult, std::optional<CoResultType> >,
-                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "Call to lambda shall return void or std::optional<std::tuple<CallbackArgs...>>\n"
                 "(present value means result is ready immediately)"
             );
 
@@ -1869,9 +1870,10 @@ namespace CoroFork_detail{
             Value&& result
         ){
             static_assert(
-                std::same_as<OperatorResult, std::optional<CoResultType>>,
-                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
-                "(present value means result is ready immediately)"
+                std::invocable<OperatorResult>,
+                "Such setup lambda shall return void or invocable\n"
+                "void means no cleanup is needed\n"
+                "invocable is a simple cleanup function to be called on scope exit"
             );
 
             // returns cleanup API
@@ -1901,7 +1903,7 @@ namespace CoroFork_detail{
         ){
             static_assert(
                 std::same_as< OperatorResult, std::optional<CoResultType> >,
-                "Call to lambda shall return void of std::optional<std::tuple<CallbackArgs...>>\n"
+                "Call to lambda shall return void or std::optional<std::tuple<CallbackArgs...>>\n"
                 "(present value means result is ready immediately)"
             );
 

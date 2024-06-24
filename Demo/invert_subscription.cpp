@@ -18,9 +18,10 @@ int main(){
     /* thats definitely for demo purposes (coroutine going loop in thread)
        to show how coroutine is driven by thread */
 
-    //Demonstrate receiving values from other thread
+    //Demonstrate receiving values (function parameter) from other thread
     corosync(){
-        std::cout<<"\nCorosync coroutine entered in "<<std::this_thread::get_id()<<"\n"<<std::endl;
+        std::cout<<"\nDemonstrate receiving values (function parameter) from other thread!!!\n"
+                    "Corosync coroutine entered in "<<std::this_thread::get_id()<<"\n"<<std::endl;
 
         // actually such co_await can be done in any coroutine
         // it is not necessary to use corosync to have invert_function))
@@ -35,7 +36,7 @@ int main(){
                     std::cout<<"thread iteration before resume i="<<i<<std::endl;
                     resumer(i); // stuff after co_await will be executed here!
                 }
-                std::cout<<"thread end"<<std::endl;
+                std::cout<<"thread end "<<std::this_thread::get_id()<<std::endl;
             }).detach();
 
             std::cout<<"after creating thread in "<<std::this_thread::get_id()<<std::endl;
@@ -65,7 +66,8 @@ int main(){
 
     //Demonstrate awaiting for "something to happen" (event) in other thread
     corosync(){
-        std::cout<<"\nAdditional corosync coroutine entered in "<<std::this_thread::get_id()<<"\n"<<std::endl;
+        std::cout<<"\nDemonstrate awaiting for \"something to happen\" (event) in other thread!!!\n"
+                   "Additional corosync coroutine entered in "<<std::this_thread::get_id()<<"\n"<<std::endl;
 
         // actually such co_await can be done in any coroutine
         // it is not necessary to use corosync to have invert_function))
@@ -80,10 +82,14 @@ int main(){
                     std::cout<<"thread iteration before resume i="<<i<<std::endl;
                     resumer(); // stuff after co_await will be executed here!
                 }
-                std::cout<<"thread end"<<std::endl;
+                std::cout<<"thread end "<<std::this_thread::get_id()<<std::endl;
             }).detach();
 
             std::cout<<"after creating thread in "<<std::this_thread::get_id()<<std::endl;
+
+            return []{
+                std::cout<<"(Optional) cleanup demo when subscription2 goes out of scope in "<<std::this_thread::get_id()<<std::endl;
+            };
         });
 
         std::cout<<"\nbefore co_await loop in "<<std::this_thread::get_id()<<std::endl;
