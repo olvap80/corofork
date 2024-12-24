@@ -4,17 +4,15 @@ set(CMAKE_CXX_STANDARD 20)
 
 # While in VSCode, use recommended extentions from extensions.json,
 # they add context menus and buttons into status bar. 
-# The set(CMAKE_BUILD_TYPE Release) has no effect on milticonfig builds.
-# To provide --config ConfigurationName in VSCode's status bar 
-# click CMake: [ConfigurationName] to select one of the configurations.
-# There are also debug and run pictograms in status bar (hover to see hint)
-# (note: those buttons are not related to debug tab))
-# See also https://github.com/microsoft/vscode-cmake-tools/blob/58a1962bf47dbd53b4798734a72192f7de12512b/docs/debug-launch.md
+# To provide --config ConfigurationName in VSCode's
+# click "Activity Bar" on the left, then go "CMake" icon.
+# See also https://github.com/microsoft/vscode-cmake-tools/blob/main/docs/debug-launch.md
 message("Generated with config types: ${CMAKE_CONFIGURATION_TYPES}")
 
 
 if(MSVC)
     # Remember _HAS_STATIC_RTTI=0 shall also do /GR-
+    # The set(CMAKE_BUILD_TYPE Release) has no effect on milticonfig builds.
 
     # uncomment below to have PDB in addition to execitable even in release 
     set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "ProgramDatabase")

@@ -2971,7 +2971,7 @@ namespace CoroFork_detail{
             }
 
         private:
-            // Instaces are created only by InvertSubscriptionHolder
+            // Instances are created only by InvertSubscriptionHolder
             friend class InvertSubscriptionHolder;
             /// Constructor for awaitable tied to InvertSubscriptionHolder
             awaitable(InvertSubscriptionHolder* correspondingHolder)
