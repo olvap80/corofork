@@ -28,3 +28,32 @@ add_executable(all_invert_function_and_callback Demo/all_invert_function_and_cal
 add_executable(go_thread_and_back Demo/go_thread_and_back.cpp)
 add_executable(invert_subscription Demo/invert_subscription.cpp)
 add_executable(multimpe_threads_invert_subscription Demo/multimpe_threads_invert_subscription.cpp)
+
+
+# Automated tests (no external dependencies, see Tests/test_framework.h).
+# Build and run them all with:
+#     cmake --build build && ctest --test-dir build --output-on-failure
+# Every test executable also runs standalone and returns the number of
+# failed cases as its exit code.
+enable_testing()
+
+set(COROFORK_TESTS
+    test_corofork
+    test_invert_function
+    test_invert_subscription
+    test_callback_pool
+)
+
+find_package(Threads REQUIRED)
+
+foreach(corofork_test IN LISTS COROFORK_TESTS)
+    add_executable(${corofork_test} Tests/${corofork_test}.cpp)
+    target_include_directories(${corofork_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Tests)
+    target_link_libraries(${corofork_test} PRIVATE Threads::Threads)
+    if(MSVC)
+        target_compile_options(${corofork_test} PRIVATE /W4)
+    else()
+        target_compile_options(${corofork_test} PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME ${corofork_test} COMMAND ${corofork_test})
+endforeach()
