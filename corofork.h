@@ -190,6 +190,31 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <queue>
 
 
+/* GCC 12 (all releases 12.1 to 12.5) destroys a lambda written inside a co_await
+   expression twice: GCC 12 makes a bitwise duplicate of the lambda before
+   invert_* receives the lambda, and destroys both, so no code inside corofork
+   can repair the duplicate. A setup lambda that captures std::string,
+   std::unique_ptr, std::vector (anything whose destructor frees memory) BY VALUE
+   and is written inside co_await crashes with double free. GCC 13.1 and later
+   are fine. What works with GCC 12 (checked by a run, no cost with other compilers):
+       - a setup lambda written inside co_await captures by reference only:
+             co_await invert_function([&](std::function<void(int)> onDone){ ... });
+       - a capture by value goes into a named lambda moved into invert_function:
+             auto setup = [url](std::function<void(int)> onDone){ ... };
+             co_await invert_function(std::move(setup));
+       - or into a helper function returning invert_function(...):
+             auto loadAsync(std::string url){
+                 return invert_function([url = std::move(url)](std::function<void(int)> onDone){ ... });
+             }
+             co_await loadAsync(url);
+   Define COROFORK_SUPPRESS_GCC12_WARNING to silence the warning once the code
+   follows the rules above. Details and the reproduction: maintenance.md,
+   "GCC 12 destroys co_await temporaries twice" */
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 12 \
+    && !defined(COROFORK_SUPPRESS_GCC12_WARNING)
+#   pragma GCC warning "corofork: GCC 12 destroys a lambda written inside co_await twice. In a setup lambda written inside co_await capture by reference only ([&]); put captures by value into a named lambda passed as invert_function(std::move(setup)) or into a helper function returning invert_function(...). Or use GCC 13.1+. Then define COROFORK_SUPPRESS_GCC12_WARNING. See maintenance.md"
+#endif
+
 
 //______________________________________________________________________________
 // The macro to start coroutine inline (see samples above)
@@ -396,7 +421,13 @@ namespace CoroFork_detail{
         NOTE: the awaiter is handed over BY VALUE (moved into the coroutine
               frame) and not by reference on purpose: returning a reference
               here makes GCC copy the awaiter into the frame, which fails
-              for the non copyable awaitables below */
+              for the non copyable awaitables below.
+              Checked by a run: g++ 12.2 rejects `-> RealAwaitable&` with
+              "use of deleted function" (copy of the awaitable), and still
+              moves the awaitable for `-> RealAwaitable&&`; g++ 16.2 and
+              clang 22 accept both reference forms, MSVC 2019 accepts
+              `-> RealAwaitable&&` (the `&` form was not checked with MSVC)
+              (details in maintenance.md, "Design decisions", item 2) */
         auto operator co_await() && -> RealAwaitable {
             return std::move(awaitable);
         }

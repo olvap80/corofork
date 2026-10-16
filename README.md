@@ -61,13 +61,53 @@ Copy `corofork.h` into your project (plus `coro_expected.h` for
 [error codes without exceptions](#9-error-codes-without-exceptions-coro_expected)),
 include `corofork.h` and compile as C++20:
 
-| Compiler | Flag | Checked with |
+| Compiler | Flag | Result |
 | --- | --- | --- |
-| g++ | `-std=c++20` | GCC 16.2 (MSYS2) |
-| clang++ | `-std=c++20` | Clang 22.1.8 (MSYS2) |
-| MSVC | `/std:c++20` | Visual Studio 2019 (MSVC 14.29) |
+| GCC 16.2 (MSYS2) | `-std=c++20` | all tests pass |
+| Clang 22.1.8 (MSYS2) | `-std=c++20` | all tests pass |
+| MSVC 2019 (14.29) | `/std:c++20` | all tests pass |
+| GCC 13.1 to 15.3 | `-std=c++20` | the `co_await` bug of GCC 12 is absent; the test suite was not run |
+| GCC 12.1 to 12.5 | `-std=c++20` | works only with the rules below |
 
-The test suite of the repository passes with all three compilers.
+### GCC 12: three rules for setup lambdas
+
+GCC 12 (every release from 12.1 to 12.5) destroys a lambda written inside a
+`co_await` expression twice. The bug is in the compiler and affects any coroutine
+code, not only corofork. A setup lambda that is written inside `co_await` and
+captures **by value** something whose destructor frees memory (`std::string`,
+`std::unique_ptr`, `std::vector`) crashes the program with
+`free(): double free detected`. GCC 13.1 and later, Clang and MSVC are not affected.
+
+With GCC 12, follow three rules (all three work with every compiler and cost
+nothing):
+
+```cpp
+// WRONG with GCC 12: capture by value in a lambda written inside co_await
+co_await invert_function([url](std::function<void(int, std::string)> onDone){
+    download(url, onDone);
+});
+
+// 1. In a lambda written inside co_await, capture by reference only.
+//    Safe: the setup lambda runs during the co_await, the variables of the block are alive.
+co_await invert_function([&](std::function<void(int, std::string)> onDone){
+    download(url, onDone);
+});
+
+// 2. A capture by value goes into a named lambda, moved into invert_function.
+auto setup = [url](std::function<void(int, std::string)> onDone){
+    download(url, onDone);
+};
+co_await invert_function(std::move(setup));
+
+// 3. Or into a helper function returning invert_function(...) (recipe 6).
+co_await downloadAsync(url);
+```
+
+With GCC 12, `corofork.h` prints a compiler warning with these rules. Once the code
+follows the rules, define `COROFORK_SUPPRESS_GCC12_WARNING` (for example
+`-DCOROFORK_SUPPRESS_GCC12_WARNING`) to silence the warning. The minimal reproduction
+and the details are in
+[maintenance.md](maintenance.md#gcc-12-destroys-co_await-temporaries-twice).
 
 ## How invert_function works
 

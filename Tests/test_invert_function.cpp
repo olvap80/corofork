@@ -404,3 +404,25 @@ COROFORK_TEST(function_setup_lambda_may_capture_move_only_value){
     stored(4);
     CHECK_EQ(received, 4);
 }
+
+COROFORK_TEST(function_named_setup_lambda_with_move_only_capture_is_moved_in){
+    /* The form README.md recommends for GCC 12: GCC 12 destroys a lambda written
+       inside co_await twice (the case above aborts with double free there),
+       a named lambda moved into invert_function is destroyed once */
+    std::function<void(int)> stored;
+    int seenBySetup = 0;
+    int received = 0;
+
+    corofork(&){
+        auto setup = [owned = std::make_unique<int>(10), &stored, &seenBySetup](std::function<void(int)> cb){
+            seenBySetup = *owned;
+            stored = cb;
+        };
+        received = co_await invert_function(std::move(setup));
+        co_return;
+    };
+
+    CHECK_EQ(seenBySetup, 10);
+    stored(6);
+    CHECK_EQ(received, 6);
+}

@@ -13,6 +13,7 @@ the known sharp edges, and the plans.
 - [Design decisions](#design-decisions)
 - [Exceptions](#exceptions)
 - [Known sharp edges](#known-sharp-edges)
+- [Compilers](#compilers)
 - [Tests](#tests)
 - [Plans](#plans)
 
@@ -200,8 +201,16 @@ In file order:
    `bool` for `void()` callbacks): `ProcessSetupResult` stores the value and
    `await_suspend` returns `false`, so the coroutine continues without suspending.
 2. **`AwaitAsTemporaryOnly::operator co_await() &&` returns the awaitable by value.**
-   According to the comment in the code, returning a reference made GCC copy the
-   awaiter into the frame, which fails for the non copyable awaitables.
+   Measured for the three forms of the return type:
+
+   | Return type | GCC 12.2 | GCC 16.2 | Clang 22.1.8 | MSVC 2019 |
+   | --- | --- | --- | --- | --- |
+   | `RealAwaitable` (current) | 2 moves of the setup lambda | 2 | 2 | 2 |
+   | `RealAwaitable&` (before commit `a636459`) | does not compile: GCC copies the awaiter, the copy constructor is deleted | compiles | compiles | not checked |
+   | `RealAwaitable&&` | compiles, still 2 moves | 1 | 1 | 1 |
+
+   The value form compiles everywhere and costs one move more than the `&&` form on
+   the newer compilers (see [Plans](#maintenance), item 1).
 3. **Generated callbacks copy what the callback returns before resuming.** Resuming
    may destroy the generated lambda itself: the `invert_callback` slot is freed at the
    end of the `co_await` full expression, the coroutine may replace the
@@ -306,6 +315,7 @@ Verified by running test programs:
 | A `corofork` body without `co_await` and `co_return`: GCC and Clang warn and the program crashes, MSVC 2019 reports error C4716 | macros | the lambda is not a coroutine, the lambda returns no `CoroFork` |
 | Exception in a `corofork` resumed by an awaitable of another library: the frame is not freed | `CoroFork::promise_type::unhandled_exception` | no `ResumeScope` for the frame |
 | `coro_expected` allocates the frame on the heap per call: GCC 16.2 and MSVC 2019 1000 allocations per 1000 calls, Clang `-O2` none | `coro_expected` | heap allocation elision only in Clang |
+| GCC 12 (12.1 to 12.5): a setup lambda written inside `co_await` and capturing by value an object that frees memory in its destructor crashes with `double free` | the compiler | GCC 12 destroys a bitwise duplicate of the lambda temporary too; the caller avoids the crash with `[&]`, a named lambda moved in, or a helper function, see [Compilers](#gcc-12-destroys-co_await-temporaries-twice) |
 
 From reading the code, not verified by a run:
 
@@ -322,6 +332,157 @@ From reading the code, not verified by a run:
 - Callback called inside the setup lambda: after the nested resume finished the
   coroutine, `await_suspend` returns `true` for a destroyed frame. The code relies on
   the compilers not touching the frame after `await_suspend` returns.
+
+## Compilers
+
+| Compiler | Where | Result |
+| --- | --- | --- |
+| GCC 16.2 | MSYS2 UCRT64 | all tests pass, `-O0` to `-O2` |
+| Clang 22.1.8 | MSYS2 UCRT64 | all tests pass, `-O0` to `-O2` |
+| MSVC 2019 (14.29) | Visual Studio 2019, CMake, `/std:c++20` | all tests pass, Debug and Release |
+| GCC 13.1, 13.2, 13.3, 13.4, 14.1, 14.2, 14.3, 14.4, 15.1, 15.2, 15.3 | Compiler Explorer (godbolt.org), x86-64 | the reproduction below passes at `-O0` and `-O2`; the test suite was not run |
+| GCC 12.2 | WSL Debian 12 (`g++ (Debian 12.2.0-14+deb12u1) 12.2.0`) | wrong code: `test_invert_function` aborts with `free(): double free detected` in `function_setup_lambda_may_capture_move_only_value` (a by value capture written inside `co_await`, kept on purpose to show the compiler bug); `test_corofork`, `test_callback_pool`, `test_invert_subscription`, `test_coro_expected` pass |
+| GCC 12.1, 12.2, 12.3, 12.4, 12.5 | Compiler Explorer (godbolt.org), x86-64 | wrong code: the reproduction below fails at `-O0` and `-O2` |
+
+### GCC 12 destroys co_await temporaries twice
+
+GCC 12 runs the destructor twice for a temporary object of a `co_await` full
+expression, when the temporary is created by a lambda expression or by aggregate
+initialization and holds a member with a destructor. Every GCC 12 release is
+affected (12.1 to 12.5), GCC 13.1 and every later release up to 15.3 are not
+(the reproduction below, run on Compiler Explorer on 2026-10-16). Measured with
+GCC 12.2 at `-O0` and `-O2` (constructions / destructions of the counted member):
+
+| Shape | GCC 12.2 | GCC 16.2, Clang 22.1.8, MSVC 2019 |
+| --- | --- | --- |
+| `co_await referencing([member = CountedMember()]{})` (lambda temporary) | 1 / 2 | 1 / 1 |
+| `co_await AggregateAwaiter{}` (struct without constructors, counted member) | 1 / 2 | 1 / 1 |
+| `co_await ConstructedAwaiter{}` (user constructor, counted member) | 1 / 1 | 1 / 1 |
+| `co_await SelfCountedAwaiter{}` (the awaiter itself counted, user constructors) | 1 / 1 | 1 / 1 |
+
+Minimal reproduction, no corofork involved (exit code 0: the compiler is fine,
+exit code 1: the lambda was destroyed twice):
+
+```cpp
+#include <coroutine>
+#include <cstdio>
+
+int constructions = 0;
+int destructions = 0;
+
+struct CountedMember{
+    CountedMember(){ ++constructions; }
+    CountedMember(const CountedMember&){ ++constructions; }
+    CountedMember(CountedMember&&) noexcept { ++constructions; }
+    ~CountedMember(){ ++destructions; }
+};
+
+/// Awaiter without counted members, keeps only a reference to the lambda (shape of the old invert_function)
+template<class Lambda>
+struct LambdaReferencingAwaiter{
+    const Lambda& lambda;
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<>) const { lambda(); return false; }
+    int await_resume() const noexcept { return 7; }
+};
+
+template<class Lambda>
+LambdaReferencingAwaiter<Lambda> referencing(const Lambda& lambda){ return {lambda}; }
+
+struct FireAndForget{
+    struct promise_type{
+        FireAndForget get_return_object(){ return {}; }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void(){}
+        void unhandled_exception(){}
+    };
+};
+
+int received = 0;
+FireAndForget awaitWithLambdaTemporary(){
+    received = co_await referencing([member = CountedMember()]{});
+}
+
+int main(){
+    awaitWithLambdaTemporary();
+    std::printf("lambda temporary with a counted capture: constructions=%d destructions=%d%s\n",
+                constructions, destructions, constructions == destructions ? "" : "   <-- destroyed twice");
+    return constructions == destructions ? 0 : 1;
+}
+```
+
+```sh
+g++ -std=c++20 -O2 reproduction.cpp -o reproduction && ./reproduction; echo "exit=$?"
+# GCC 12.x: lambda temporary with a counted capture: constructions=1 destructions=2   <-- destroyed twice
+#           exit=1
+# GCC 13.1 and later: lambda temporary with a counted capture: constructions=1 destructions=1
+#           exit=0
+```
+
+Consequences for corofork:
+
+- Every `invert_*` call passes a lambda temporary inside a `co_await` expression,
+  so with GCC 12 a setup lambda capturing `std::string`, `std::unique_ptr` or
+  `std::vector` by value frees the same memory twice. The header of commit `a636459`
+  crashes the same way (a setup lambda capturing a 64 character `std::string`
+  aborts with exit code 134), so the problem is older than the setup lambda
+  ownership of decision 11.
+- The tests of the repository saw nothing before `function_setup_lambda_may_capture_move_only_value`
+  existed: the other setup lambdas capture with `[&]`, and values moved out through
+  `co_await` are empty afterwards, a second destructor call on an empty
+  `std::string` or a null `std::unique_ptr` frees nothing.
+- Which object is destroyed twice (traced with GCC 12.2, every construction and
+  destruction printed with an id): for `co_await invert_function([traced = TracedValue()](...){...})`
+  the values are constructed as id 1 (the capture of the lambda temporary), id 2
+  (moved into the awaitable), id 3 (moved into the frame), and destroyed as id 3,
+  id 2, then an object at an address where no constructor ever ran, carrying id 1,
+  then id 1. GCC 12 makes a bitwise duplicate of the lambda temporary before
+  `invert_function` receives the lambda, and destroys the duplicate as well. A
+  `std::string` or `std::unique_ptr` capture of the duplicate still points to the
+  memory owned by id 2 and id 3: double free.
+- No workaround inside the library is possible: the duplicate is made in the code of
+  the caller, before any corofork code runs. Making `AwaitAsTemporaryOnly` itself the
+  awaiter (forwarding `await_*`, with only `operator co_await() &` deleted) fails with
+  GCC 12.2 and GCC 16.2 alike anyway: GCC picks the deleted `&` overload for a prvalue
+  operand.
+- The workaround is on the side of the caller, and costs nothing with the other
+  compilers (the same code). Checked with a 64 character `std::string` and a
+  `std::unique_ptr` capture, GCC 12.2 at `-O0` and `-O2`, GCC 16.2, Clang 22.1.8:
+
+  | Setup lambda | GCC 12.2 | GCC 16.2, Clang 22.1.8 |
+  | --- | --- | --- |
+  | written inside `co_await`, captures by value | double free, exit code 134 | works |
+  | written inside `co_await`, captures by reference (`[&]`) | works | works |
+  | named lambda with captures by value, `co_await invert_function(std::move(setup))` | works | works |
+  | helper function returning `invert_function([url = std::move(url)](...){...})` | works | works |
+  | a value for the callback to return: `invert_function(setup, TracedValue())` | works (traced: no double destruction) | works |
+
+  README.md ("GCC 12: three rules for setup lambdas") and the text of the GCC 12
+  warning in `corofork.h` state the rules. Tests of the recommended forms:
+  `function_named_setup_lambda_with_move_only_capture_is_moved_in` (rule 2),
+  `function_helper_may_return_invert_function` (rule 3).
+- The GCC bug tracker has reports of the same kind: PR 99576
+  (<https://gcc.gnu.org/pipermail/gcc-bugs/2021-June/744474.html>), PR 107288
+  (<https://gcc.gnu.org/pipermail/gcc-bugs/2024-May/864034.html>), and a patch
+  addressing PR 99576, 100611, 101976, 101367 and 107288
+  (<https://patchwork.sourceware.org/comment/133834/>). Which of the reported bugs
+  matches the measured one was not confirmed; the measurement shows the first good
+  release: GCC 13.1.
+
+`corofork.h` emits `#pragma GCC warning` when `__GNUC__ == 12` (Clang excluded),
+right after the includes; `-DCOROFORK_SUPPRESS_GCC12_WARNING` removes the warning.
+Checked with GCC 12.2: one warning per translation unit, with `-Werror` the build
+stops; GCC 16.2, Clang 22.1.8 and MSVC 2019 show no warning. The pragma is used
+instead of `#warning`: with `-std=c++20 -Wpedantic`, `#warning` adds a warning of its
+own ("#warning is a GCC extension" from GCC 12.2, "'#warning' before C++23 is a GCC
+extension" from GCC 16.2), `#pragma GCC warning` adds nothing.
+
+To check another GCC version: compile and run the reproduction above (exit code 0
+expected), then run the test suite. The single test that exposes the bug is
+`function_setup_lambda_may_capture_move_only_value` in `test_invert_function`.
+The test suite of corofork has not been run with GCC 13, 14 or 15 yet: Compiler
+Explorer received only the reproduction above, never code of corofork.
 
 ## Tests
 
@@ -349,8 +510,7 @@ ctest --test-dir build --output-on-failure
   tests for decision 11, the helper tests crashed and
   `function_named_setup_lambda_is_copied_once` failed with the header from before;
   the `*_moved_not_copied` tests pass with both headers and guard the cost from now on.
-- Checked toolchains: GCC 16.2 and Clang 22.1.8 from MSYS2 UCRT64, MSVC 2019 (14.29)
-  through CMake with `/std:c++20`.
+- Checked toolchains and their results: see [Compilers](#compilers).
 - Every C++ sample of README.md compiles with all three compilers (each sample as a
   separate translation unit, with declarations of the fictional APIs added). The
   single exception is intended: MSVC rejects the sample of the pitfall "A block without
@@ -363,9 +523,10 @@ ctest --test-dir build --output-on-failure
 
 1. **One move of the setup lambda per `co_await` instead of two**: return
    `RealAwaitable&&` from `AwaitAsTemporaryOnly::operator co_await() &&` (see
-   [Design decisions](#design-decisions), item 11). Measured to work with GCC 16.2,
-   Clang 22.1.8 and MSVC 2019. Blocked by the note in the code that GCC copied the
-   awaiter for a returned reference: check the oldest supported GCC first.
+   [Design decisions](#design-decisions), items 2 and 11). Measured: GCC 16.2,
+   Clang 22.1.8 and MSVC 2019 make 1 move, GCC 12.2 compiles the form and still makes
+   2 moves. Measure GCC 13, 14 and 15 with the corofork tests first (needs a local
+   GCC 13 or later, Compiler Explorer got only the reproduction).
 2. **Safe synchronous completion through the callback.** When the API calls the
    callback before the setup lambda returns, the generated callback sets an atomic flag
    instead of resuming nested, and `await_suspend` returns `false`. A callback arriving
