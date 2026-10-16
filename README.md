@@ -261,42 +261,47 @@ co_await invert_function([](std::function<void()> wake){
 
 ### 6. One helper per API call
 
-The setup lambdas repeat. Put each one into a helper function that **returns the
-setup lambda**, and keep `invert_function` at the `co_await`:
+The setup lambdas repeat. Put each API call into a helper function that returns
+`invert_function(...)`, and `co_await` the helper:
 
 ```cpp
-auto downloading(std::string url){
-    return [url](std::function<void(int, std::string)> onDone){
+auto downloadAsync(std::string url){
+    return invert_function([url = std::move(url)](std::function<void(int, std::string)> onDone){
         download(url, onDone);
-    };
+    });
 }
 
-auto waiting(std::chrono::milliseconds delay){
-    return [delay](std::function<void()> wake){
+auto waitAsync(std::chrono::milliseconds delay){
+    return invert_function([delay](std::function<void()> wake){
         startTimer(delay, wake);
-    };
+    });
 }
 ```
 
 ```cpp
-auto [status, body] = co_await invert_function(downloading(url));
-co_await invert_function(waiting(std::chrono::seconds(1)));
+auto [status, body] = co_await downloadAsync(url);
+co_await waitAsync(std::chrono::seconds(1));
 ```
 
-Do not return `invert_function(...)` itself from a helper
-([why](#returning-invert_function-from-a-helper)).
+- The result of `invert_function` owns the setup lambda: the setup lambda is moved
+  into the result, without a heap allocation.
+- Inside a helper, capture by value (`[url = std::move(url)]`, `[delay]`). A `[&]`
+  capture of a parameter or a local variable of the helper refers to a variable that
+  is gone once the helper returns.
+- `co_await` the helper right away. `auto pending = downloadAsync(url); co_await pending;`
+  is rejected at compile time, write `co_await downloadAsync(url)` instead.
 
 With helpers, a retry with a growing pause is a plain loop:
 
 ```cpp
 corofork(url){
     for( int attempt = 1; attempt <= 3; ++attempt ){
-        auto [status, body] = co_await invert_function(downloading(url));
+        auto [status, body] = co_await downloadAsync(url);
         if( status == 200 ){
             save(body);
             co_return;
         }
-        co_await invert_function(waiting(std::chrono::seconds(attempt)));
+        co_await waitAsync(std::chrono::seconds(attempt));
     }
     showError(503);
 };
@@ -307,7 +312,7 @@ corofork(url){
 ```cpp
 int main(){
     corosync(&){
-        auto [status, body] = co_await invert_function(downloading("https://example.com"));
+        auto [status, body] = co_await downloadAsync("https://example.com");
         std::printf("%d: %s\n", status, body.c_str());
     };
     // the download has finished here
@@ -326,7 +331,7 @@ int main(){
 
 ```cpp
 corosync(&){
-    auto [status, body] = co_await invert_function(downloading(url)); // in the network thread now
+    auto [status, body] = co_await downloadAsync(url); // in the network thread now
     co_await back_to_thread;                                           // in the calling thread again
     Report report = parseHugeDocument(body);                           // the network thread is free
     printReport(report);
@@ -446,7 +451,7 @@ block, the exception leaves without destroying the block (details in
 void onRefreshClicked(){
     std::string url = currentUrl();
     corofork(&){ // WRONG
-        auto [status, body] = co_await invert_function(downloading(url));
+        auto [status, body] = co_await downloadAsync(url);
         logLine(url); // onRefreshClicked has returned long ago, url is destroyed
     };
 }
@@ -467,7 +472,7 @@ Capture a `std::shared_ptr` to the object, for example
 
 ```cpp
 std::lock_guard lock(cacheMutex); // WRONG
-auto [status, body] = co_await invert_function(downloading(url));
+auto [status, body] = co_await downloadAsync(url);
 cache[url] = body;
 ```
 
@@ -482,7 +487,7 @@ cache[url] = body;
 Lock only around code without `co_await`:
 
 ```cpp
-auto [status, body] = co_await invert_function(downloading(url));
+auto [status, body] = co_await downloadAsync(url);
 {
     std::lock_guard lock(cacheMutex);
     cache[url] = body;
@@ -508,25 +513,6 @@ In `corosync`, `co_await back_to_thread;` returns to the thread that called
 - A callback that is never called means the block never continues: a `corofork`
   keeps the captured copies forever, a `corosync` blocks the caller forever. Make sure
   the API calls the callback on errors and on cancellation too.
-
-### Returning invert_function from a helper
-
-```cpp
-auto downloadAsync(std::string url){ // WRONG
-    return invert_function([url](std::function<void(int, std::string)> onDone){
-        download(url, onDone);
-    });
-}
-```
-
-`invert_function` keeps a reference to the setup lambda, and the setup lambda is
-destroyed when `downloadAsync` returns. The later `co_await downloadAsync(url)`
-uses the destroyed lambda: the test program crashed with GCC and silently
-"worked" with Clang `-O2`, both are undefined behavior.
-
-Return the setup lambda instead ([recipe 6](#6-one-helper-per-api-call)). For the same
-reason `auto pending = invert_function(...); co_await pending;` is rejected at compile
-time.
 
 ### Calling the callback inside the setup lambda
 

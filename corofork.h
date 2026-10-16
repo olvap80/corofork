@@ -79,10 +79,20 @@ NOTE: remember invert_function and invert_callback will work with
       any coroutine that is able to do co_await operation,
       you can use them without corofork macro.
 
-      also please remember to await result of invert_* immediately
-      while the "full expression" being inverted still exists
-      (do not store result of invert_* for later awaiting,
-       because that may lead to dangling references inside).
+      also please remember to await result of invert_* immediately:
+      `auto pending = invert_function(...); co_await pending;` is rejected
+      at compile time, write `co_await invert_function(...)` instead.
+      The result of invert_* owns the setup lambda (moved in, no heap
+      allocation), so a helper function may return invert_function(...):
+          auto downloadAsync(std::string url){
+              return invert_function(
+                  [url = std::move(url)](std::function<void(int, std::string)> onDone){
+                      download(url, onDone);
+                  });
+          }
+          auto [status, body] = co_await downloadAsync(url);
+      Inside such a helper capture by value: a [&] capture of a local
+      variable of the helper dangles once the helper returns.
 
 You can pass your generated callback to any API, assuming signature fits.
 For example here is artificial sample doing the same thing as
@@ -368,9 +378,17 @@ namespace CoroFork_detail{
         AwaitAsTemporaryOnly(const AwaitAsTemporaryOnly&) = delete;
         AwaitAsTemporaryOnly& operator=(const AwaitAsTemporaryOnly&) = delete;
 
-        /// Moves awaitable only from the temporary
-        AwaitAsTemporaryOnly(RealAwaitable&& realAwaitable)
-            : awaitable(std::move(realAwaitable)){}
+        /**Constructs the awaitable in place from the arguments of invert_*.
+        In place on purpose: the awaitable owns the setup lambda, and
+        constructing the awaitable here (instead of moving a ready one in)
+        saves one move of the setup lambda */
+        template<class... AwaitableConstructorArguments>
+        explicit AwaitAsTemporaryOnly(
+            std::in_place_t, AwaitableConstructorArguments&&... awaitableConstructorArguments
+        )
+            : awaitable(
+                std::forward<AwaitableConstructorArguments>(awaitableConstructorArguments)...
+              ) {}
 
         /**It is possible to issue co_await only on "full expression" in coroutine.
         Thus "saving/moving to some other location and awaiting later" is explicitly banned,
@@ -603,22 +621,28 @@ Once that generated function callback is called it will
 resume the coroutine awaiting for the result of invert_function,
 and callback arguments will go to caller.
 Remember to await result of invert_function immediately.
+The returned awaitable owns the setup lambda (a temporary lambda is moved in,
+a named one is copied), so a helper function may return invert_function(...),
+see "One helper per API call" in README.md.
 See samples above for illustration */
-template<CoroForkLambdaToSetupFunction LambdaToSetupFunction>
+template<class LambdaToSetupFunction>
+requires
+    CoroForkLambdaToSetupFunction<std::remove_cvref_t<LambdaToSetupFunction>>
 [[nodiscard(
     "The result of invert_function must be co_awaited right away,"
     " dropping it means the setup lambda is never even invoked"
 )]]
 auto invert_function(
-    const LambdaToSetupFunction& setupFunction ///< receives generated callback
+    LambdaToSetupFunction&& setupFunction ///< receives generated callback
 ){
+    using SetupLambda = std::remove_cvref_t<LambdaToSetupFunction>;
     using Awaitable = CoroFork_detail::AwaitableGeneratedCBNoResult<
         CoroFork_detail::TheSame,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupFunction>::CoResultType,
-        LambdaToSetupFunction
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::CoResultType,
+        SetupLambda
     >;
     return CoroFork_detail::AwaitAsTemporaryOnly<Awaitable>(
-        Awaitable(setupFunction)
+        std::in_place, std::forward<LambdaToSetupFunction>(setupFunction)
     );
 }
 
@@ -629,14 +653,17 @@ the generated function callback can be provided.
 Remember to await result of invert_function immediately.
 See samples above for illustration. */
 template<
-    CoroForkLambdaToSetupFunction LambdaToSetupFunction,
+    class LambdaToSetupFunction,
     class ResultForCallbackFunctionAsValue
 >
 requires
-    std::convertible_to<
+    CoroForkLambdaToSetupFunction<std::remove_cvref_t<LambdaToSetupFunction>>
+    && std::convertible_to<
         std::remove_cvref_t<ResultForCallbackFunctionAsValue>,
         std::remove_cvref_t<
-            typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupFunction>::FunctionResultType
+            typename CoroFork_detail::GenerateForSetupLambda<
+                std::remove_cvref_t<LambdaToSetupFunction>
+            >::FunctionResultType
         >
     >
 [[nodiscard(
@@ -644,21 +671,21 @@ requires
     " dropping it means the setup lambda is never even invoked"
 )]]
 auto invert_function(
-    const LambdaToSetupFunction& setupFunction, ///< Your setup
+    LambdaToSetupFunction&& setupFunction, ///< Your setup
     ResultForCallbackFunctionAsValue&& resultForCallbackFunction
 ){
+    using SetupLambda = std::remove_cvref_t<LambdaToSetupFunction>;
     using Awaitable = CoroFork_detail::AwaitableGeneratedCBReturnsValue<
         CoroFork_detail::TheSame,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupFunction>::CoResultType,
-        LambdaToSetupFunction,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupFunction>::FunctionResultType
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::CoResultType,
+        SetupLambda,
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::FunctionResultType
     >;
 
     return CoroFork_detail::AwaitAsTemporaryOnly<Awaitable>(
-        Awaitable(
-            setupFunction,
-            std::forward<ResultForCallbackFunctionAsValue>(resultForCallbackFunction)
-        )
+        std::in_place,
+        std::forward<LambdaToSetupFunction>(setupFunction),
+        std::forward<ResultForCallbackFunctionAsValue>(resultForCallbackFunction)
     );
 }
 
@@ -666,13 +693,16 @@ auto invert_function(
 Remember here coroutine is resumed directly from the callback, thus
 functionToObtainResultForCallback is issued once we await for "something else" */
 template<
-    CoroForkLambdaToSetupFunction LambdaToSetupFunction, ///< Your setup
+    class LambdaToSetupFunction, ///< Your setup
     std::invocable FunctionToObtainResult
 >
 requires
-    std::same_as<
+    CoroForkLambdaToSetupFunction<std::remove_cvref_t<LambdaToSetupFunction>>
+    && std::same_as<
         std::remove_cvref_t<
-            typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupFunction>::FunctionResultType
+            typename CoroFork_detail::GenerateForSetupLambda<
+                std::remove_cvref_t<LambdaToSetupFunction>
+            >::FunctionResultType
         >,
         std::remove_cvref_t<
             std::invoke_result_t< std::remove_cvref_t<FunctionToObtainResult> >
@@ -683,20 +713,21 @@ requires
     " dropping it means the setup lambda is never even invoked"
 )]]
 auto invert_function(
-    const LambdaToSetupFunction& setupFunction,
+    LambdaToSetupFunction&& setupFunction,
     FunctionToObtainResult&& functionToObtainResultForCallbackFunction
 ){
+    using SetupLambda = std::remove_cvref_t<LambdaToSetupFunction>;
     using Awaitable = CoroFork_detail::AwaitableGeneratedCBReturnsResultOfCall<
         CoroFork_detail::TheSame,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupFunction>::CoResultType,
-        LambdaToSetupFunction,
-        FunctionToObtainResult
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::CoResultType,
+        SetupLambda,
+        std::remove_cvref_t<FunctionToObtainResult>
     >;
 
     return CoroFork_detail::AwaitAsTemporaryOnly<Awaitable>(
-        Awaitable(
-            setupFunction, functionToObtainResultForCallbackFunction
-        )
+        std::in_place,
+        std::forward<LambdaToSetupFunction>(setupFunction),
+        std::forward<FunctionToObtainResult>(functionToObtainResultForCallbackFunction)
     );
 }
 
@@ -711,27 +742,30 @@ generated at this place are still in use (the exception can be caught
 around the co_await expression inside the coroutine) */
 template<
     std::size_t maxCallbacksCount, ///< Specify callback count per lambda
-    CoroForkLambdaToSetupCallback LambdaToSetupCallback ///< Your setup
+    class LambdaToSetupCallback ///< Your setup
 >
+requires
+    CoroForkLambdaToSetupCallback<std::remove_cvref_t<LambdaToSetupCallback>>
 [[nodiscard(
     "The result of invert_callback must be co_awaited right away,"
     " dropping it means the setup lambda is never even invoked"
 )]]
 auto invert_callback(
-    const LambdaToSetupCallback& setupCallback
+    LambdaToSetupCallback&& setupCallback
 ){
+    using SetupLambda = std::remove_cvref_t<LambdaToSetupCallback>;
     using Awaitable = CoroFork_detail::AwaitableGeneratedCBNoResult<
         CoroFork_detail::ToPlainC<
-            maxCallbacksCount, LambdaToSetupCallback
+            maxCallbacksCount, SetupLambda
         >,
         typename CoroFork_detail::GenerateForSetupLambda<
-            LambdaToSetupCallback
+            SetupLambda
         >::CoResultType,
-        LambdaToSetupCallback
+        SetupLambda
     >;
 
     return CoroFork_detail::AwaitAsTemporaryOnly<Awaitable>(
-        Awaitable(setupCallback)
+        std::in_place, std::forward<LambdaToSetupCallback>(setupCallback)
     );
 }
 
@@ -743,14 +777,17 @@ See samples above for illustration.
 Remember here coroutine is resumed directly from the callback */
 template<
     std::size_t maxCallbacksCount, ///< Specify callback count per lambda
-    CoroForkLambdaToSetupCallback LambdaToSetupCallback, ///< Your setup
+    class LambdaToSetupCallback, ///< Your setup
     class ResultForCallbackFunctionAsValue
 >
 requires
-    std::convertible_to<
+    CoroForkLambdaToSetupCallback<std::remove_cvref_t<LambdaToSetupCallback>>
+    && std::convertible_to<
         std::remove_cvref_t<ResultForCallbackFunctionAsValue>,
         std::remove_cvref_t<
-            typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupCallback>::FunctionResultType
+            typename CoroFork_detail::GenerateForSetupLambda<
+                std::remove_cvref_t<LambdaToSetupCallback>
+            >::FunctionResultType
         >
     >
 [[nodiscard(
@@ -758,23 +795,23 @@ requires
     " dropping it means the setup lambda is never even invoked"
 )]]
 auto invert_callback(
-    const LambdaToSetupCallback& setupCallback,
+    LambdaToSetupCallback&& setupCallback,
     ResultForCallbackFunctionAsValue&& resultForCallback
 ){
+    using SetupLambda = std::remove_cvref_t<LambdaToSetupCallback>;
     using Awaitable = CoroFork_detail::AwaitableGeneratedCBReturnsValue<
         CoroFork_detail::ToPlainC<
-            maxCallbacksCount, LambdaToSetupCallback
+            maxCallbacksCount, SetupLambda
         >,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupCallback>::CoResultType,
-        LambdaToSetupCallback,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupCallback>::FunctionResultType
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::CoResultType,
+        SetupLambda,
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::FunctionResultType
     >;
 
     return CoroFork_detail::AwaitAsTemporaryOnly<Awaitable>(
-        Awaitable(
-            setupCallback,
-            std::forward<ResultForCallbackFunctionAsValue>(resultForCallback)
-        )
+        std::in_place,
+        std::forward<LambdaToSetupCallback>(setupCallback),
+        std::forward<ResultForCallbackFunctionAsValue>(resultForCallback)
     );
 }
 
@@ -783,13 +820,16 @@ Remember here coroutine is resumed directly from the callback, thus
 functionToObtainResultForCallback is issued once we await for "something else" */
 template<
     std::size_t maxCallbacksCount, ///< Specify callback count per lambda
-    CoroForkLambdaToSetupCallback LambdaToSetupCallback, ///< Your setup
+    class LambdaToSetupCallback, ///< Your setup
     std::invocable FunctionToObtainResult
 >
 requires
-    std::same_as<
+    CoroForkLambdaToSetupCallback<std::remove_cvref_t<LambdaToSetupCallback>>
+    && std::same_as<
         std::remove_cvref_t<
-            typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupCallback>::FunctionResultType
+            typename CoroFork_detail::GenerateForSetupLambda<
+                std::remove_cvref_t<LambdaToSetupCallback>
+            >::FunctionResultType
         >,
         std::remove_cvref_t<
             std::invoke_result_t< std::remove_cvref_t<FunctionToObtainResult> >
@@ -800,22 +840,23 @@ requires
     " dropping it means the setup lambda is never even invoked"
 )]]
 auto invert_callback(
-    const LambdaToSetupCallback& setupCallback,
+    LambdaToSetupCallback&& setupCallback,
     FunctionToObtainResult&& functionToObtainResultForCallback
 ){
+    using SetupLambda = std::remove_cvref_t<LambdaToSetupCallback>;
     using Awaitable = CoroFork_detail::AwaitableGeneratedCBReturnsResultOfCall<
         CoroFork_detail::ToPlainC<
-            maxCallbacksCount, LambdaToSetupCallback
+            maxCallbacksCount, SetupLambda
         >,
-        typename CoroFork_detail::GenerateForSetupLambda<LambdaToSetupCallback>::CoResultType,
-        LambdaToSetupCallback,
-        FunctionToObtainResult
+        typename CoroFork_detail::GenerateForSetupLambda<SetupLambda>::CoResultType,
+        SetupLambda,
+        std::remove_cvref_t<FunctionToObtainResult>
     >;
 
     return CoroFork_detail::AwaitAsTemporaryOnly<Awaitable>(
-        Awaitable(
-            setupCallback, functionToObtainResultForCallback
-        )
+        std::in_place,
+        std::forward<LambdaToSetupCallback>(setupCallback),
+        std::forward<FunctionToObtainResult>(functionToObtainResultForCallback)
     );
 }
 
@@ -2413,10 +2454,10 @@ namespace CoroFork_detail{
     // Awaitable for generating callback that does not return a value
 
     /** Awaitable being used by invert_function (generated callback returns nothing).
-    Setup lambda is alive as long as full-expression exists,
-    thus both setup lambda and Awaitable instance coexist simultaneously,
-    see https://stackoverflow.com/questions/62620147/c-coroutines-temporaries-in-co-await-expressions
-    for more details (temporaries are destroyed at the end of the full-expression) */
+    The awaitable owns the setup lambda (moved in by invert_*), so the setup
+    lambda lives as long as the awaitable, also when a helper function returns
+    the result of invert_* (the awaitable itself lives in the coroutine frame
+    until the end of the co_await full expression) */
     template<
         class Decorator,
         class CoResult,
@@ -2424,9 +2465,12 @@ namespace CoroFork_detail{
     >
     class AwaitableGeneratedCBNoResult: public Decorator{
     public:
-        /// Tie with setup lambda
-        AwaitableGeneratedCBNoResult(const SetupLambdaType& setupLambdaToUse)
-            : setupLambda(setupLambdaToUse) {}
+        /**Take the setup lambda over (moved in from a temporary, copied from a named lambda).
+        Constrained, so this template never replaces the move constructor */
+        template<class InitialSetupLambda>
+        requires std::constructible_from<SetupLambdaType, InitialSetupLambda&&>
+        explicit AwaitableGeneratedCBNoResult(InitialSetupLambda&& setupLambdaToUse)
+            : setupLambda(std::forward<InitialSetupLambda>(setupLambdaToUse)) {}
 
         /// Suspends (await_suspend must see handle before setup lambda is invoked)
         constexpr bool await_ready() const noexcept { return false;  }
@@ -2454,8 +2498,8 @@ namespace CoroFork_detail{
         }
 
     private:
-        /// Link to corresponding setup
-        const SetupLambdaType& setupLambda;
+        /// Owned setup lambda (moved in by invert_*)
+        SetupLambdaType setupLambda;
 
         static_assert(!std::is_same_v<CoResult, void>);
 
@@ -2467,9 +2511,12 @@ namespace CoroFork_detail{
     template<class Decorator, class SetupLambdaType>
     class AwaitableGeneratedCBNoResult<Decorator, void, SetupLambdaType>: public Decorator{
     public:
-        /// Tie with setup lambda
-        AwaitableGeneratedCBNoResult(const SetupLambdaType& setupLambdaToUse)
-            : setupLambda(setupLambdaToUse) {}
+        /**Take the setup lambda over (moved in from a temporary, copied from a named lambda).
+        Constrained, so this template never replaces the move constructor */
+        template<class InitialSetupLambda>
+        requires std::constructible_from<SetupLambdaType, InitialSetupLambda&&>
+        explicit AwaitableGeneratedCBNoResult(InitialSetupLambda&& setupLambdaToUse)
+            : setupLambda(std::forward<InitialSetupLambda>(setupLambdaToUse)) {}
 
         /// Always suspends (shall not skip await_suspend)
         constexpr bool await_ready() const noexcept { return false;  }
@@ -2488,8 +2535,8 @@ namespace CoroFork_detail{
         constexpr void await_resume() const noexcept {}
 
     private:
-        /// Link to corresponding setup
-        const SetupLambdaType& setupLambda;
+        /// Owned setup lambda (moved in by invert_*)
+        SetupLambdaType setupLambda;
     };
 
 
@@ -2497,10 +2544,10 @@ namespace CoroFork_detail{
     // Awaitable for generating callback that returns predefined value
 
     /** Awaitable being used by invert_function (case of value).
-    Setup lambda is alive as long as full-expression exists,
-    thus both setup lambda and Awaitable instance coexist simultaneously,
-    see https://stackoverflow.com/questions/62620147/c-coroutines-temporaries-in-co-await-expressions
-    for more details (temporaries are destroyed at the end of the full-expression) */
+    The awaitable owns the setup lambda (moved in by invert_*), so the setup
+    lambda lives as long as the awaitable, also when a helper function returns
+    the result of invert_* (the awaitable itself lives in the coroutine frame
+    until the end of the co_await full expression) */
     template<
         class Decorator,
         class CoResult,
@@ -2509,13 +2556,13 @@ namespace CoroFork_detail{
     >
     class AwaitableGeneratedCBReturnsValue: public Decorator{
     public:
-        /// Tie with setup lambda
-        template<class ValueType>
+        /// Take the setup lambda over (moved in from a temporary, copied from a named lambda)
+        template<class InitialSetupLambda, class ValueType>
         AwaitableGeneratedCBReturnsValue(
-            const SetupLambdaType& setupLambdaToUse,
+            InitialSetupLambda&& setupLambdaToUse,
             ValueType&& whatGeneratedCallbackReturns
         )
-            : setupLambda(setupLambdaToUse)
+            : setupLambda(std::forward<InitialSetupLambda>(setupLambdaToUse))
             , valueGeneratedCallbackReturns(std::forward<ValueType>(whatGeneratedCallbackReturns))
         {}
 
@@ -2552,11 +2599,9 @@ namespace CoroFork_detail{
         }
 
     private:
-        /// Link to corresponding setup
-        const SetupLambdaType& setupLambda;
-        /** Exactly the same thing as is was received by invert_function.
-        Reference is valid since awaitable exists as long as awaitable
-        (for the time of full expression) */
+        /// Owned setup lambda (moved in by invert_*)
+        SetupLambdaType setupLambda;
+        /// What invert_* received for the generated callback (moved in, owned)
         std::remove_reference_t<GeneratedCallbackResultType> valueGeneratedCallbackReturns;
 
         static_assert(!std::is_same_v<CoResult, void>);
@@ -2571,13 +2616,13 @@ namespace CoroFork_detail{
         Decorator, void, SetupLambdaType, GeneratedCallbackResultType
     >: public Decorator{
     public:
-        /// Tie with setup lambda
-        template<class ValueType>
+        /// Take the setup lambda over (moved in from a temporary, copied from a named lambda)
+        template<class InitialSetupLambda, class ValueType>
         AwaitableGeneratedCBReturnsValue(
-            const SetupLambdaType& setupLambdaToUse,
+            InitialSetupLambda&& setupLambdaToUse,
             ValueType&& whatGeneratedCallbackReturns
         )
-            : setupLambda(setupLambdaToUse)
+            : setupLambda(std::forward<InitialSetupLambda>(setupLambdaToUse))
             , valueGeneratedCallbackReturns(std::forward<ValueType>(whatGeneratedCallbackReturns))
         {}
 
@@ -2605,11 +2650,9 @@ namespace CoroFork_detail{
         constexpr void await_resume() const noexcept {}
 
     private:
-        /// Link to corresponding setup
-        const SetupLambdaType& setupLambda;
-        /** Exactly the same thing as is was received by invert_function.
-        Reference is valid since awaitable exists as long as awaitable
-            (for the time of full expression) */
+        /// Owned setup lambda (moved in by invert_*)
+        SetupLambdaType setupLambda;
+        /// What invert_* received for the generated callback (moved in, owned)
         std::remove_reference_t<GeneratedCallbackResultType> valueGeneratedCallbackReturns;
     };
 
@@ -2618,10 +2661,10 @@ namespace CoroFork_detail{
     // Awaitable for generating callback that calls callback for result
 
     /** Awaitable being used by invert_function (case of callback returning result).
-    Setup lambda is alive as long as full-expression exists,
-    thus both setup lambda and Awaitable instance coexist simultaneously,
-    see https://stackoverflow.com/questions/62620147/c-coroutines-temporaries-in-co-await-expressions
-    for more details (temporaries are destroyed at the end of the full-expression) */
+    The awaitable owns the setup lambda (moved in by invert_*), so the setup
+    lambda lives as long as the awaitable, also when a helper function returns
+    the result of invert_* (the awaitable itself lives in the coroutine frame
+    until the end of the co_await full expression) */
     template<
         class Decorator,
         class CoResult,
@@ -2630,13 +2673,13 @@ namespace CoroFork_detail{
     >
     class AwaitableGeneratedCBReturnsResultOfCall: public Decorator{
     public:
-        /// Tie with setup lambda
-        template<class CalculateResultFunctionType>
+        /// Take the setup lambda over (moved in from a temporary, copied from a named lambda)
+        template<class InitialSetupLambda, class CalculateResultFunctionType>
         AwaitableGeneratedCBReturnsResultOfCall(
-            const SetupLambdaType& setupLambdaToUse,
+            InitialSetupLambda&& setupLambdaToUse,
             CalculateResultFunctionType&& whatGeneratedCallbackReturns
         )
-            : setupLambda(setupLambdaToUse)
+            : setupLambda(std::forward<InitialSetupLambda>(setupLambdaToUse))
             , callbackToCallFromGeneratedCallback(
                 std::forward<CalculateResultFunctionType>(whatGeneratedCallbackReturns)
               )
@@ -2675,11 +2718,9 @@ namespace CoroFork_detail{
         }
 
     private:
-        /// Link to corresponding setup
-        const SetupLambdaType& setupLambda;
-        /** Exactly the same thing as is was received by invert_function.
-        Reference is valid since awaitable exists as long as awaitable
-        (for the time of full expression) */
+        /// Owned setup lambda (moved in by invert_*)
+        SetupLambdaType setupLambda;
+        /// What invert_* received for the generated callback (moved in, owned)
         std::remove_reference_t<CallbackToCallFromGeneratedCallbackType> callbackToCallFromGeneratedCallback;
 
         static_assert(!std::is_same_v<CoResult, void>);
@@ -2694,13 +2735,13 @@ namespace CoroFork_detail{
         Decorator, void, SetupLambdaType, CallbackToCallFromGeneratedCallbackType
     >: public Decorator{
     public:
-        /// Tie with setup lambda
-        template<class CalculateResultFunctionType>
+        /// Take the setup lambda over (moved in from a temporary, copied from a named lambda)
+        template<class InitialSetupLambda, class CalculateResultFunctionType>
         AwaitableGeneratedCBReturnsResultOfCall(
-            const SetupLambdaType& setupLambdaToUse,
+            InitialSetupLambda&& setupLambdaToUse,
             CalculateResultFunctionType&& whatGeneratedCallbackReturns
         )
-            : setupLambda(setupLambdaToUse)
+            : setupLambda(std::forward<InitialSetupLambda>(setupLambdaToUse))
             , callbackToCallFromGeneratedCallback(
                 std::forward<CalculateResultFunctionType>(whatGeneratedCallbackReturns)
               )
@@ -2730,11 +2771,9 @@ namespace CoroFork_detail{
         constexpr void await_resume() const noexcept {}
 
     private:
-        /// Link to corresponding setup
-        const SetupLambdaType& setupLambda;
-        /** Exactly the same thing as is was received by invert_function.
-        Reference is valid since awaitable exists as long as awaitable
-        (for the time of full expression) */
+        /// Owned setup lambda (moved in by invert_*)
+        SetupLambdaType setupLambda;
+        /// What invert_* received for the generated callback (moved in, owned)
         std::remove_reference_t<CallbackToCallFromGeneratedCallbackType> callbackToCallFromGeneratedCallback;
     };
 

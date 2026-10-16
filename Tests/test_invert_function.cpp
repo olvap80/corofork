@@ -307,3 +307,100 @@ COROFORK_TEST(function_returned_value_survives_callback_replaced_while_resumed){
     CHECK_EQ(LifetimeTrackedValue::copiesFromDestroyedSource, 0);
     CHECK((received == std::vector<int>{1, 2}));
 }
+
+
+//______________________________________________________________________________
+// the awaitable owns the setup lambda: helpers may return invert_function(...),
+// and the setup lambda is moved, never copied, never placed on the heap
+
+namespace{
+    /// Helper returning invert_function(...): the setup lambda dies with the helper unless owned
+    auto storeCallbackAsync(
+        std::function<void(int)>& stored,
+        corofork_test::LifetimeTrackedValue tracked,
+        int& payloadSeenBySetup
+    ){
+        return invert_function(
+            [&stored, &payloadSeenBySetup, tracked](std::function<void(int)> cb){
+                corofork_test::LifetimeTrackedValue copyInSetup = tracked;
+                payloadSeenBySetup = copyInSetup.payload;
+                stored = cb;
+            }
+        );
+    }
+}
+
+COROFORK_TEST(function_helper_may_return_invert_function){
+    using corofork_test::LifetimeTrackedValue;
+    std::function<void(int)> stored;
+    int payloadSeenBySetup = 0;
+    int received = 0;
+
+    LifetimeTrackedValue::copiesFromDestroyedSource = 0;
+    corofork(&){
+        received = co_await storeCallbackAsync(stored, LifetimeTrackedValue(64), payloadSeenBySetup);
+        co_return;
+    };
+
+    CHECK_EQ(payloadSeenBySetup, 64);
+    CHECK_EQ(LifetimeTrackedValue::copiesFromDestroyedSource, 0);
+    if( stored ){
+        stored(5);
+    }
+    CHECK_EQ(received, 5);
+}
+
+COROFORK_TEST(function_setup_lambda_is_moved_not_copied){
+    using corofork_test::CopyMoveCounter;
+    std::function<void()> stored;
+
+    CopyMoveCounter::Reset();
+    corofork(&){
+        co_await invert_function(
+            [counter = CopyMoveCounter(), &stored](std::function<void()> cb){ stored = cb; }
+        );
+        co_return;
+    };
+
+    /* 2 moves: into the awaitable (constructed in place inside
+       AwaitAsTemporaryOnly), then out of AwaitAsTemporaryOnly::operator co_await
+       into the coroutine frame */
+    CHECK_EQ(CopyMoveCounter::copies, 0);
+    CHECK(CopyMoveCounter::moves <= 2);
+    stored();
+}
+
+COROFORK_TEST(function_named_setup_lambda_is_copied_once){
+    using corofork_test::CopyMoveCounter;
+    std::function<void()> stored;
+
+    CopyMoveCounter::Reset();
+    corofork(&){
+        auto setup = [counter = CopyMoveCounter(), &stored](std::function<void()> cb){ stored = cb; };
+        co_await invert_function(setup); //a named lambda stays usable, so it is copied
+        co_return;
+    };
+
+    CHECK_EQ(CopyMoveCounter::copies, 1);
+    stored();
+}
+
+COROFORK_TEST(function_setup_lambda_may_capture_move_only_value){
+    std::function<void(int)> stored;
+    int seenBySetup = 0;
+    int received = 0;
+
+    corofork(&){
+        received = co_await invert_function(
+            [owned = std::make_unique<int>(9), &stored, &seenBySetup](std::function<void(int)> cb){
+                seenBySetup = *owned;
+                stored = cb;
+            }
+        );
+        co_return;
+    };
+
+    CHECK_EQ(seenBySetup, 9);
+    stored(4);
+    CHECK_EQ(received, 4);
+}

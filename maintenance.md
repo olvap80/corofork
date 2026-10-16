@@ -84,8 +84,8 @@ alive at that point and frees the frame, `address()` gives the frame address.
 - **One shot.** A suspension point is resumed at most once. A coroutine cannot be
   copied.
 - **Temporaries of a `co_await` full expression live in the frame** until the end of
-  that full expression. The setup lambda passed to `invert_function` and the awaitable
-  returned by `invert_function` stay alive while the coroutine waits.
+  that full expression. The awaitable returned by `invert_function` (the awaitable owns
+  the setup lambda) stays alive while the coroutine waits.
 - **A lambda used as a coroutine is not copied into the frame.** The frame keeps only
   a pointer to the closure object (the implicit `this` parameter). The captures live in
   the closure object, outside the frame. This is the reason for
@@ -116,9 +116,10 @@ In file order:
    lambda, and `CoroFork::Start` decides how to call the lambda. `corosync` adds a
    lambda parameter `back_to_thread`.
 2. **`AwaitAsTemporaryOnly`.** Wraps every awaitable returned by `invert_function` and
-   `invert_callback`: `operator co_await() &&` hands out the real awaitable,
-   `operator co_await() &` is deleted, so `auto pending = invert_function(...); co_await pending;`
-   does not compile.
+   `invert_callback`. The constructor taking `std::in_place` constructs the real
+   awaitable inside `AwaitAsTemporaryOnly` from the arguments of `invert_*`.
+   `operator co_await() &&` hands out the real awaitable, `operator co_await() &` is
+   deleted, so `auto pending = invert_function(...); co_await pending;` does not compile.
 3. **Declarations of the utility API**: `callback_from_lambda`, `callback_extend_lifetime`,
    `scoped_callback_holder`, `scoped_callback`.
 4. **Concepts** `CoroForkLambdaToSetupFunction`, `CoroForkLambdaToSetupCallback`.
@@ -144,6 +145,7 @@ In file order:
    and raw function pointer parameters (adding `RawPointerCallbackType`) to the twelve.
 10. **Awaitables** `AwaitableGeneratedCBNoResult`, `AwaitableGeneratedCBReturnsValue`,
     `AwaitableGeneratedCBReturnsResultOfCall` (plus specializations for `void` results):
+    the member `setupLambda` owns the setup lambda (moved in by `invert_*`),
     `await_ready()` returns `false`, `await_suspend` calls the matching
     `GenerateForSetupMethod` function, `await_resume` moves the result out of a
     `std::optional`. The base class (`Decorator`) turns the generated lambda into what
@@ -181,7 +183,7 @@ In file order:
 | `corosync` frame | `CoroSync::Start` | `Start` calls `handle.destroy()` after `ReportCompletionAwaiter` reported completion |
 | `corosync` closure object | the full expression of the `corosync` statement | after `Start` returns, `Start` waits for the body |
 | `CoroSync::promise_type::SharedState` | stack of `CoroSync::Start` | when `Start` returns |
-| setup lambda | temporary of the `co_await` full expression | end of that full expression |
+| setup lambda | the awaitable (member `setupLambda`, moved in by `invert_*`) | together with the awaitable |
 | `AwaitableGeneratedCB*` awaitable | temporary of the `co_await` full expression | end of that full expression |
 | generated `std::function` | the API that received the `std::function` | decided by the API |
 | callback pool slot of `invert_callback` | `ToPlainC::keepAlive` of the awaitable | end of the `co_await` full expression |
@@ -239,6 +241,28 @@ In file order:
     `coro_unexpected`, everything else hits a `static_assert` with an explanation.
     `value() &&` and `error() &&` return by value: returning `Value&&` dangled for
     `auto&& number = parseDigit('7').value();` (GCC reported `-Wdangling-reference`).
+11. **The awaitables own the setup lambda.** `invert_function` and `invert_callback`
+    take the setup lambda as a forwarding reference, and the awaitable keeps the setup
+    lambda in the member `setupLambda`: a temporary lambda is moved in, a named lambda
+    is copied (a named lambda stays usable after the call). Before, the awaitables kept
+    `const SetupLambdaType&`, and a helper function returning `invert_function(...)`
+    left a reference to a destroyed lambda (GCC: crash, Clang `-O2`: silently
+    "worked"). Measured cost per `co_await` with GCC 16.2, Clang 22.1.8 (`-O0`, `-O2`)
+    and MSVC 2019 (`/O2`), for `invert_function` and `invert_callback`:
+    0 heap allocations, 0 copies, 2 moves of the setup lambda. The 2 moves:
+    - into `setupLambda`, while `AwaitAsTemporaryOnly` constructs the awaitable in place
+      (`std::in_place` constructor, no move of a ready awaitable),
+    - out of `AwaitAsTemporaryOnly::operator co_await() &&`, which returns the awaitable
+      by value (item 2) into the coroutine frame.
+
+    A move of a lambda moves the captures: no allocation for `std::string`,
+    `std::unique_ptr`, `std::vector`. A setup lambda may capture move only values.
+    Tests: `function_helper_may_return_invert_function`,
+    `invert_callback_helper_may_return_invert_callback`,
+    `function_setup_lambda_is_moved_not_copied`,
+    `invert_callback_setup_lambda_is_moved_not_copied`,
+    `function_named_setup_lambda_is_copied_once`,
+    `function_setup_lambda_may_capture_move_only_value`.
 
 ## Exceptions
 
@@ -277,7 +301,6 @@ Verified by running test programs:
 
 | Sharp edge | Where | Root cause |
 | --- | --- | --- |
-| A helper function returning `invert_function(...)` dangles (crash with GCC, silent with Clang `-O2`) | awaitables | the awaitables store `const SetupLambdaType&`, the setup lambda dies when the helper returns |
 | The callback called inside the setup lambda, then the setup lambda reads its captures: reads destroyed objects | `SetupCB*` | the nested resume finishes the `co_await` full expression and destroys the setup lambda while the setup lambda runs |
 | `corosync` in the thread that delivers the awaited callback: deadlock | `CoroSync::Start` | `Start` blocks the thread |
 | A `corofork` body without `co_await` and `co_return`: GCC and Clang warn and the program crashes, MSVC 2019 reports error C4716 | macros | the lambda is not a coroutine, the lambda returns no `CoroFork` |
@@ -318,9 +341,14 @@ ctest --test-dir build --output-on-failure
 - `corofork_test::LifetimeTrackedValue` detects copies made from a destroyed object
   (the destructor overwrites a `volatile` marker). Use the type for every "is the
   capture still alive" question.
+- `corofork_test::CopyMoveCounter` counts copies and moves of itself. Captured by a
+  setup lambda, the counters show what `invert_*` costs (decision 11).
 - To prove a new test catches a bug, build the test against the header without the fix:
   `git show HEAD:corofork.h > <directory>/corofork.h` and put `<directory>` first in the
-  include path. Every test added for bugs A–E failed that way before the fix.
+  include path. Every test added for bugs A–E failed that way before the fix. Of the
+  tests for decision 11, the helper tests crashed and
+  `function_named_setup_lambda_is_copied_once` failed with the header from before;
+  the `*_moved_not_copied` tests pass with both headers and guard the cost from now on.
 - Checked toolchains: GCC 16.2 and Clang 22.1.8 from MSYS2 UCRT64, MSVC 2019 (14.29)
   through CMake with `/std:c++20`.
 - Every C++ sample of README.md compiles with all three compilers (each sample as a
@@ -333,9 +361,11 @@ ctest --test-dir build --output-on-failure
 
 ### Maintenance
 
-1. **Store the setup lambda by value in the awaitables** instead of
-   `const SetupLambdaType&`. A helper returning `invert_function(...)` becomes safe.
-   Cost: one move of the setup lambda per `co_await`.
+1. **One move of the setup lambda per `co_await` instead of two**: return
+   `RealAwaitable&&` from `AwaitAsTemporaryOnly::operator co_await() &&` (see
+   [Design decisions](#design-decisions), item 11). Measured to work with GCC 16.2,
+   Clang 22.1.8 and MSVC 2019. Blocked by the note in the code that GCC copied the
+   awaiter for a returned reference: check the oldest supported GCC first.
 2. **Safe synchronous completion through the callback.** When the API calls the
    callback before the setup lambda returns, the generated callback sets an atomic flag
    instead of resuming nested, and `await_suspend` returns `false`. A callback arriving

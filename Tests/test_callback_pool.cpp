@@ -352,6 +352,65 @@ COROFORK_TEST(invert_callback_exhausted_pool_throws_inside_coroutine){
 
 
 //______________________________________________________________________________
+// the awaitable owns the setup lambda: helpers may return invert_callback(...),
+// and the setup lambda is moved, never copied
+
+namespace{
+    /// Helper returning invert_callback(...): the setup lambda dies with the helper unless owned
+    auto storePlainCallbackAsync(
+        void (*&stored)(int),
+        corofork_test::LifetimeTrackedValue tracked,
+        int& payloadSeenBySetup
+    ){
+        return invert_callback<1>(
+            [&stored, &payloadSeenBySetup, tracked](void (*cb)(int)){
+                corofork_test::LifetimeTrackedValue copyInSetup = tracked;
+                payloadSeenBySetup = copyInSetup.payload;
+                stored = cb;
+            }
+        );
+    }
+}
+
+COROFORK_TEST(invert_callback_helper_may_return_invert_callback){
+    using corofork_test::LifetimeTrackedValue;
+    void (*stored)(int) = nullptr;
+    int payloadSeenBySetup = 0;
+    int received = 0;
+
+    LifetimeTrackedValue::copiesFromDestroyedSource = 0;
+    corofork(&){
+        received = co_await storePlainCallbackAsync(stored, LifetimeTrackedValue(65), payloadSeenBySetup);
+        co_return;
+    };
+
+    CHECK_EQ(payloadSeenBySetup, 65);
+    CHECK_EQ(LifetimeTrackedValue::copiesFromDestroyedSource, 0);
+    if( stored ){
+        stored(6);
+    }
+    CHECK_EQ(received, 6);
+}
+
+COROFORK_TEST(invert_callback_setup_lambda_is_moved_not_copied){
+    using corofork_test::CopyMoveCounter;
+    void (*stored)() = nullptr;
+
+    CopyMoveCounter::Reset();
+    corofork(&){
+        co_await invert_callback<1>(
+            [counter = CopyMoveCounter(), &stored](void (*cb)()){ stored = cb; }
+        );
+        co_return;
+    };
+
+    CHECK_EQ(CopyMoveCounter::copies, 0);
+    CHECK(CopyMoveCounter::moves <= 2); //same 2 moves as invert_function
+    stored();
+}
+
+
+//______________________________________________________________________________
 // the node behind a scoped_callback is not freed by the call, so the lambda
 // must be invoked where it lives (moving it out would leave everything it
 // captured by value in a "moved from" state for every next call)

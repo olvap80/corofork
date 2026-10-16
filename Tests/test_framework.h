@@ -110,6 +110,25 @@ namespace corofork_test{
         }
     };
 
+    /**Counts copies and moves of itself (reset by the test).
+    Captured by a setup lambda, the counters tell how often invert_*
+    copies and moves the setup lambda */
+    struct CopyMoveCounter{
+        static inline int copies = 0;
+        static inline int moves = 0;
+
+        static void Reset(){
+            copies = 0;
+            moves = 0;
+        }
+
+        CopyMoveCounter() = default;
+        CopyMoveCounter(const CopyMoveCounter&){ ++copies; }
+        CopyMoveCounter(CopyMoveCounter&&) noexcept { ++moves; }
+        CopyMoveCounter& operator=(const CopyMoveCounter&){ ++copies; return *this; }
+        CopyMoveCounter& operator=(CopyMoveCounter&&) noexcept { ++moves; return *this; }
+    };
+
 } //namespace corofork_test
 
 
