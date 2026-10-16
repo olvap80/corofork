@@ -70,6 +70,46 @@ namespace corofork_test{
                     file, line, expression, detail.c_str());
     }
 
+    /**Value that detects being copied after its destruction.
+    The destructor overwrites aliveMarker (volatile, so the compiler keeps
+    that store), the copy operations count copies made from such a source.
+    Used to catch generated callbacks that read their captures after
+    resuming the coroutine (resuming may destroy those captures) */
+    struct LifetimeTrackedValue{
+        static constexpr int aliveMarkerValue = 0x600D;
+        static constexpr int destroyedMarkerValue = 0xDEAD;
+
+        /// Copies made from an already destroyed instance (reset by the test)
+        static inline int copiesFromDestroyedSource = 0;
+
+        explicit LifetimeTrackedValue(int payloadToStore): payload(payloadToStore) {}
+
+        LifetimeTrackedValue(const LifetimeTrackedValue& source): payload(source.payload){
+            CountIfDestroyed(source);
+        }
+
+        LifetimeTrackedValue& operator=(const LifetimeTrackedValue& source){
+            CountIfDestroyed(source);
+            payload = source.payload;
+            return *this;
+        }
+
+        ~LifetimeTrackedValue(){ aliveMarker = destroyedMarkerValue; }
+
+        /// Overwritten by the destructor
+        volatile int aliveMarker = aliveMarkerValue;
+
+        /// What the test checks for
+        int payload;
+
+    private:
+        static void CountIfDestroyed(const LifetimeTrackedValue& source){
+            if( source.aliveMarker != aliveMarkerValue ){
+                ++copiesFromDestroyedSource;
+            }
+        }
+    };
+
 } //namespace corofork_test
 
 

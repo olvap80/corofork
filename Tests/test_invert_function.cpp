@@ -14,9 +14,11 @@ That keeps every case single threaded and fully deterministic.
 #include "test_framework.h"
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <tuple>
+#include <vector>
 
 
 //______________________________________________________________________________
@@ -235,4 +237,73 @@ COROFORK_TEST(function_sequence_of_awaits){
 
     second(2);
     CHECK_EQ(sum, 42);
+}
+
+
+//______________________________________________________________________________
+// callback arguments of move only types are moved through, never copied
+
+COROFORK_TEST(function_argument_of_move_only_type){
+    std::function<void(std::unique_ptr<int>)> stored;
+    int received = 0;
+
+    corofork(&){
+        std::unique_ptr<int> value = co_await invert_function(
+            [&](std::function<void(std::unique_ptr<int>)> cb){ stored = cb; }
+        );
+        received = *value;
+        co_return;
+    };
+
+    stored(std::make_unique<int>(77));
+    CHECK_EQ(received, 77);
+}
+
+COROFORK_TEST(function_multiple_arguments_of_move_only_type){
+    std::function<void(std::unique_ptr<int>, std::string)> stored;
+    int receivedNumber = 0;
+    std::string receivedText;
+
+    corofork(&){
+        auto [number, text] = co_await invert_function(
+            [&](std::function<void(std::unique_ptr<int>, std::string)> cb){ stored = cb; }
+        );
+        receivedNumber = *number;
+        receivedText = text;
+        co_return;
+    };
+
+    stored(std::make_unique<int>(5), std::string("five"));
+    CHECK_EQ(receivedNumber, 5);
+    CHECK_EQ(receivedText, std::string("five"));
+}
+
+
+//______________________________________________________________________________
+// the coroutine replaces the std::function being executed right now,
+// the generated callback must not read own captures after resuming
+
+COROFORK_TEST(function_returned_value_survives_callback_replaced_while_resumed){
+    using corofork_test::LifetimeTrackedValue;
+    std::function<LifetimeTrackedValue(int)> stored;
+    std::vector<int> received;
+
+    corofork(&){
+        for( int round = 0; round < 2; ++round ){
+            received.push_back(co_await invert_function(
+                [&](std::function<LifetimeTrackedValue(int)> cb){ stored = cb; },
+                LifetimeTrackedValue(100 + round)
+            ));
+        }
+        co_return;
+    };
+
+    LifetimeTrackedValue::copiesFromDestroyedSource = 0;
+    LifetimeTrackedValue firstReturned = stored(1); //the coroutine replaces stored inside
+    LifetimeTrackedValue secondReturned = stored(2);
+
+    CHECK_EQ(firstReturned.payload, 100);
+    CHECK_EQ(secondReturned.payload, 101);
+    CHECK_EQ(LifetimeTrackedValue::copiesFromDestroyedSource, 0);
+    CHECK((received == std::vector<int>{1, 2}));
 }

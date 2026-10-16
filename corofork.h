@@ -193,6 +193,11 @@ one can provide =, &, or named captures as well.
 but can be suspended and resumed in other thread later.
 The "fork" suffix means coroutine lifetime and execution
 is independent from the creating thread (caller thread is not blocked).
+Exception escaping the body propagates to the code that resumed the coroutine:
+before the first suspension that is the corofork statement itself,
+afterwards that is the call of the generated callback (invert_function,
+invert_callback, invert_subscription). In both cases the coroutine frame
+and the captures are freed before the exception propagates.
 Be aware: mutexes shall not be crossed by co_await, because
 one can resume coroutine from different thread, but mutex
 is still owned by previous thread! */
@@ -221,9 +226,28 @@ in this way we can reuse existing thread for running the computation
 in the coroutine without blocking other threads/message queues, etc,
 see samples above.
 
-Exceptions are forwarded from "other thread" to this one
-(so corosync will rethrow all exceptions being thrown in
-any "other thread" driving the coroutine to the caller thread)
+Every exception escaping the body is rethrown by corosync in the caller thread
+(after the coroutine frame is destroyed), no matter which code resumed the
+coroutine: the caller thread, a generated callback (invert_function,
+invert_callback, invert_subscription) in another thread, or an awaitable of
+another library calling plain handle.resume(). In the thread that resumed the
+coroutine, the generated callback or resume() returns normally.
+
+Inside corosync await invert_* directly:
+ @code
+    corosync(&){
+        int answer = co_await invert_function([&](std::function<void(int)> cb){
+            AsyncRequest(cb);
+        });
+        Use(answer); //exception thrown here reaches the corosync caller
+    };
+ @endcode
+Do not start a nested corofork inside the corosync body for the same purpose:
+the nested corofork is an independent coroutine, corosync does not wait for
+the nested corofork, and an exception thrown by the nested corofork after its
+first suspension propagates to the code that resumed the nested corofork
+(for example a callback in another thread), never to the corosync caller.
+
 Be aware: mutexes shall not be crossed by co_await, because
 one can resume our coroutine from different thread, but mutex
 is sill owned by previous thread! */
@@ -681,7 +705,10 @@ auto invert_function(
 // invert_callback API for generating "pain C" style callbacks
 
 
-/// Turn "plain C style" callback based API into coroutine based
+/**Turn "plain C style" callback based API into coroutine based.
+co_await throws std::runtime_error when maxCallbacksCount callbacks
+generated at this place are still in use (the exception can be caught
+around the co_await expression inside the coroutine) */
 template<
     std::size_t maxCallbacksCount, ///< Specify callback count per lambda
     CoroForkLambdaToSetupCallback LambdaToSetupCallback ///< Your setup
@@ -872,6 +899,54 @@ auto invert_subscription(
 namespace CoroFork_detail{
 
     //__________________________________________________________________________
+    // Exceptions escaping the body of a corofork coroutine
+
+    /**One resumption of a coroutine done by corofork itself.
+    CoroFork::Start and every generated callback resume the coroutine through
+    ResumeAndPropagateException, which keeps a ResumeScope on the stack.
+    Nested resumptions on one thread form a list of scopes,
+    ResumeScope::innermostScope points to the most recent one */
+    struct ResumeScope{
+        /// Frame resumed in this scope (std::coroutine_handle<>::address)
+        void* resumedFrameAddress;
+
+        /// Scope of the enclosing resumption on the same thread (nullptr if none)
+        ResumeScope* enclosingScope;
+
+        /**Exception escaped from the body of the resumed frame.
+        CoroFork::promise_type::unhandled_exception writes the exception here,
+        final_suspend destroys the frame afterwards, and only then
+        ResumeAndPropagateException rethrows the exception */
+        std::exception_ptr exceptionFromBody;
+
+        /// Innermost resumption done by corofork on the current thread
+        static inline thread_local ResumeScope* innermostScope = nullptr;
+    };
+
+    /**Resume the coroutine, then rethrow the exception escaped from the coroutine body.
+    The exception is rethrown after the coroutine frame is destroyed,
+    so captures and locals of a corofork coroutine are freed first */
+    inline void ResumeAndPropagateException(std::coroutine_handle<> handle){
+        ResumeScope scope{handle.address(), ResumeScope::innermostScope, nullptr};
+
+        /// Puts the enclosing scope back on every exit (also once resume() throws)
+        struct InnermostScopeRestorer{
+            ResumeScope& restoredScope;
+            ~InnermostScopeRestorer(){
+                ResumeScope::innermostScope = restoredScope.enclosingScope;
+            }
+        } innermostScopeRestorer{scope};
+
+        ResumeScope::innermostScope = &scope;
+        handle.resume();
+
+        if( scope.exceptionFromBody ){
+            std::rethrow_exception(scope.exceptionFromBody);
+        }
+    }
+
+
+    //__________________________________________________________________________
     // General corofork macro support
 
     /// Actual implementation of corofork/corosync macro
@@ -927,8 +1002,25 @@ namespace CoroFork_detail{
         /// Just do nothing
         void return_void() const noexcept {}
 
-        /// Once exception happens, let it propagate
-        void unhandled_exception() const { throw; }
+        /**Once exception happens, let it propagate to the code that resumed the coroutine.
+        Resumed by corofork itself (CoroFork::Start or a generated callback):
+            the exception goes to the matching ResumeScope, final_suspend destroys
+            the frame, then ResumeAndPropagateException rethrows the exception.
+        Resumed by an awaitable of another library (no ResumeScope for this frame):
+            the exception propagates from resume() right away, and the frame
+            is never freed (the coroutine is considered suspended at the
+            final suspend point, final_suspend does not run) */
+        void unhandled_exception(){
+            ResumeScope* innermostScope = ResumeScope::innermostScope;
+            void* thisFrameAddress =
+                std::coroutine_handle<promise_type>::from_promise(*this).address();
+
+            if( innermostScope && innermostScope->resumedFrameAddress == thisFrameAddress ){
+                innermostScope->exceptionFromBody = std::current_exception();
+                return; //goes on to final_suspend, which destroys the frame
+            }
+            throw;
+        }
 
         /** Shall let coroutine to be destroyed by reaching end.
         let it cleanup self in natural way, as coroutine execution reaches end
@@ -998,8 +1090,12 @@ namespace CoroFork_detail{
         started.myPromise->capturingFunction = std::move(capture);
 
         /* Here coroutine is resumed from the current thread (runs first time)
-        all actions will happen immediately in this thread */
-        std::coroutine_handle<promise_type>::from_promise(*started.myPromise).resume();
+        all actions will happen immediately in this thread,
+        exception thrown before the first suspension is rethrown here
+        (after the frame and the captures are freed) */
+        ResumeAndPropagateException(
+            std::coroutine_handle<promise_type>::from_promise(*started.myPromise)
+        );
 
         /*once we are here this means coroutine eiter suspended or executes
         in some other thread, or it is already finished */
@@ -1113,19 +1209,21 @@ namespace CoroFork_detail{
             /// Exception to be propagated from corosync
             std::exception_ptr exception;
 
-            /// Mark coroutine as finished (will not resume)
-            void return_void() noexcept {
+            /**Keep exception to be rethrown by corosync in the initial thread.
+            state is not changed here, ReportCompletion changes state
+            once the coroutine reaches the final suspend point */
+            void unhandled_exception() noexcept {
                 std::lock_guard lock(protectPromise);
-                state = State::FinishedNormally;
-                waitForPromise.notify_one();
+                exception = std::current_exception();
             }
 
-            /// Once exception happens, let it propagate to the initial thread
-            void unhandled_exception() noexcept {
-                //propagate exception to the future (to be propagated from corosync)
+            /**Mark coroutine as finished (will not resume), wake up CoroSync::Start.
+            Called at the final suspend point, all locals of the body are destroyed
+            already. CoroSync::Start may destroy the frame and this SharedState
+            right after the lock below is released */
+            void ReportCompletion() noexcept {
                 std::lock_guard lock(protectPromise);
-                state = State::FinishedWithException;
-                exception = std::current_exception();
+                state = exception ? State::FinishedWithException : State::FinishedNormally;
                 waitForPromise.notify_one();
             }
         };
@@ -1136,24 +1234,38 @@ namespace CoroFork_detail{
         NOTE: BackToThreadAwaitable above relies on the same guarantee */
         SharedState* sharedState = nullptr;
 
-        /// Mark coroutine as finished
-        void return_void() noexcept {
-            sharedState->return_void();
-        }
+        /**Do nothing here, ReportCompletionAwaiter reports completion instead.
+        After an explicit co_return the locals of the body are destroyed
+        AFTER return_void (g++ and clang++ both do so), reporting completion here
+        lets corosync return while destructors of those locals still run
+        in another thread */
+        void return_void() const noexcept {}
 
         /// Once exception happens, let it propagate to the initial thread
         void unhandled_exception() noexcept {
             sharedState->unhandled_exception();
         }
 
-        /** Shall let coroutine to be destroyed by reaching end.
-        let it cleanup self in natural way, as coroutine execution reaches end
-        https://stackoverflow.com/questions/68352718/is-it-necessary-to-call-destroy-on-a-stdcoroutine-handle
-        */
-        std::suspend_never final_suspend() const noexcept {
-            // do nothing (lambda will fade away together with the promise)
-            return {}; //let coroutine destruct
-        }
+        /// Awaiter for the final suspend point: reports completion, coroutine stays suspended
+        class ReportCompletionAwaiter{
+        public:
+            /// Always suspend, CoroSync::Start destroys the frame
+            bool await_ready() const noexcept { return false; }
+
+            /**All locals of the body are destroyed by now.
+            After ReportCompletion returns, CoroSync::Start may destroy the frame
+            (this awaiter included), so nothing is touched afterwards */
+            void await_suspend(std::coroutine_handle<promise_type> handle) const noexcept {
+                handle.promise().sharedState->ReportCompletion();
+            }
+
+            void await_resume() const noexcept {}
+        };
+
+        /**Report completion once the body is left completely.
+        The frame is not destroyed by reaching the end,
+        CoroSync::Start calls destroy() once it sees the terminal state */
+        ReportCompletionAwaiter final_suspend() const noexcept { return {}; }
     };
 
 
@@ -1165,7 +1277,7 @@ namespace CoroFork_detail{
 
         /* Owned by this frame:
         the loop below does not exit until the coroutine reached
-        a terminal state (and destroyed itself in final_suspend),
+        a terminal state (and the loop destroyed the coroutine frame),
         this is why "just plain pointers" can be kept by the promise and by
         BackToThreadAwaitable as they stay valid for the entire coroutine lifetime */
         CoroSync::promise_type::SharedState sharedState;
@@ -1188,9 +1300,9 @@ namespace CoroFork_detail{
             handle.resume();
 
             /*once we are here this means coroutine either suspended or
-            executes in some other thread, or it is already finished and maybe destroyed,
-            (but in any case sharedState is still alive, it is owned by this frame,
-            either other thread is finished it or this one marks for end) */
+            executes in some other thread, or it is already finished
+            (suspended at the final suspend point, destroyed only below),
+            in any case sharedState is still alive, it is owned by this frame */
 
             std::unique_lock lock(sharedState.protectPromise);
             while(
@@ -1199,12 +1311,17 @@ namespace CoroFork_detail{
             ){
                 switch( sharedState.state ){
                     case CoroSync::promise_type::SharedState::State::FinishedNormally:
-                        //coroutine is done and destroyed, sharedState dies with this frame
+                        /* coroutine is suspended at the final suspend point,
+                        locals of the body are destroyed, no other thread touches the frame */
+                        lock.unlock();
+                        handle.destroy();
+                        //sharedState dies with this frame
                         return;
                     case CoroSync::promise_type::SharedState::State::FinishedWithException:
-                        /* coroutine is done and destroyed as well, exception_ptr is
-                        copied into rethrow_exception, so the exception being thrown
-                        outlives sharedState */
+                        lock.unlock();
+                        handle.destroy();
+                        /* exception_ptr is copied into rethrow_exception,
+                        so the exception being thrown outlives sharedState */
                         std::rethrow_exception(sharedState.exception);
                     case CoroSync::promise_type::SharedState::State::Running:
                         //coroutine is still driven by somebody, keep waiting below
@@ -1297,7 +1414,7 @@ namespace CoroFork_detail{
             );
             // inverts result to resume the coroutine
             return !setupLambda(
-                self->Decorate(handle)
+                self->Decorate([handle]{ ResumeAndPropagateException(handle); })
             );
         }
 
@@ -1340,7 +1457,7 @@ namespace CoroFork_detail{
             const LambdaType& setupLambda
         ){
             setupLambda(
-                self->Decorate(handle)
+                self->Decorate([handle]{ ResumeAndPropagateException(handle); })
             );
             return true; //means stay suspended (this is ok even if already resumed)
         }
@@ -1392,8 +1509,8 @@ namespace CoroFork_detail{
                 setupLambda(
                     self->Decorate(
                         [=](CallbackArg arg){
-                            self->EmplaceCoResult(arg); //what will be returned to coroutine
-                            handle();
+                            self->EmplaceCoResult(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
+                            ResumeAndPropagateException(handle);
                         }
                     )
                 ),
@@ -1416,7 +1533,7 @@ namespace CoroFork_detail{
             // returns cleanup API
             return setupLambda(
                 self->Decorate([=](CallbackArg arg){
-                    self->OnArgumentsArrived(arg); //what will be returned to coroutine
+                    self->OnArgumentsArrived(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
                 })
             );
         }
@@ -1445,8 +1562,8 @@ namespace CoroFork_detail{
             setupLambda(
                 self->Decorate(
                     [=](CallbackArg arg){
-                        self->EmplaceCoResult(arg); //what will be returned to coroutine
-                        handle();
+                        self->EmplaceCoResult(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
+                        ResumeAndPropagateException(handle);
                     }
                 )
             );
@@ -1461,7 +1578,7 @@ namespace CoroFork_detail{
         ){
             setupLambda(
                 self->Decorate([=](CallbackArg arg){
-                    self->OnArgumentsArrived(arg); //what will be returned to coroutine
+                    self->OnArgumentsArrived(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
                 })
             );
             // returns cleanup API that does nothing
@@ -1498,8 +1615,8 @@ namespace CoroFork_detail{
                 setupLambda(
                     self->Decorate(
                         [=](CallbackArgs... args){
-                            self->EmplaceCoResult(args...); //what will be returned to coroutine
-                            handle();
+                            self->EmplaceCoResult(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                            ResumeAndPropagateException(handle);
                         }
                     )
                 ),
@@ -1522,7 +1639,7 @@ namespace CoroFork_detail{
             // returns cleanup API
             return setupLambda(
                 self->Decorate([=](CallbackArgs... args){
-                    self->OnArgumentsArrived(args...); //what will be returned to coroutine
+                    self->OnArgumentsArrived(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
                 })
             );
         }
@@ -1549,8 +1666,8 @@ namespace CoroFork_detail{
             setupLambda(
                 self->Decorate(
                     [=](CallbackArgs... args){
-                        self->EmplaceCoResult(args...); //what will be returned to coroutine
-                        handle();
+                        self->EmplaceCoResult(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                        ResumeAndPropagateException(handle);
                     }
                 )
             );
@@ -1565,7 +1682,7 @@ namespace CoroFork_detail{
         ){
             setupLambda(
                 self->Decorate([=](CallbackArgs... args){
-                    self->OnArgumentsArrived(args...); //what will be returned to coroutine
+                    self->OnArgumentsArrived(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
                 })
             );
             // returns cleanup API that does nothing
@@ -1610,9 +1727,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](){
-                        handle(); //resume the coroutine
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        ResumeAndPropagateException(handle); //resume the coroutine
+                        return resultForCaller;
                     }
                 )
             );
@@ -1639,9 +1759,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](){
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
                         self->OnEventHappened();
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        return resultForCaller;
                     }
                 )
             );
@@ -1670,9 +1793,12 @@ namespace CoroFork_detail{
                             std::forward<Function>(resultGetter)
                         )
                     ](){
-                        handle(); //resume the coroutine
-                        // calculateResult is alive as long as capture exists
-                        return calculateResult();
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto calculateResultForCaller = calculateResult;
+                        ResumeAndPropagateException(handle); //resume the coroutine
+                        return calculateResultForCaller();
                     }
                 )
             );
@@ -1703,9 +1829,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](){
-                        handle(); //resume the coroutine
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        ResumeAndPropagateException(handle); //resume the coroutine
+                        return resultForCaller;
                     }
                 )
             );
@@ -1727,9 +1856,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](){
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
                         self->OnEventHappened();
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        return resultForCaller;
                     }
                 )
             );
@@ -1753,9 +1885,12 @@ namespace CoroFork_detail{
                             std::forward<Function>(resultGetter)
                         )
                     ](){
-                        handle(); //resume the coroutine
-                        // calculateResult is alive as long as capture exists
-                        return calculateResult();
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto calculateResultForCaller = calculateResult;
+                        ResumeAndPropagateException(handle); //resume the coroutine
+                        return calculateResultForCaller();
                     }
                 )
             );
@@ -1800,10 +1935,13 @@ namespace CoroFork_detail{
                                 std::forward<Value>(result)
                             )
                         ](CallbackArg arg){
-                            self->EmplaceCoResult(arg); //what will be returned to coroutine
-                            handle();
-                            // storedResult is alive as long as capture exists
-                            return storedResult;
+                            /* copied before the coroutine is resumed: code resumed in the coroutine
+                               may destroy this very lambda (frees the trampoline node, unsubscribes
+                               or replaces the std::function holding the lambda) */
+                            auto resultForCaller = storedResult;
+                            self->EmplaceCoResult(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
+                            ResumeAndPropagateException(handle);
+                            return resultForCaller;
                         }
                     )
                 ),
@@ -1833,9 +1971,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](CallbackArg arg){
-                        self->OnArgumentsArrived(arg);
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        self->OnArgumentsArrived(std::forward<CallbackArg>(arg));
+                        return resultForCaller;
                     }
                 )
             );
@@ -1864,10 +2005,13 @@ namespace CoroFork_detail{
                                 std::forward<Function>(resultGetter)
                             )
                         ](CallbackArg arg){
-                            self->EmplaceCoResult(arg); //what will be returned to coroutine
-                            handle();
-                            // calculateResult is alive as long capture exists
-                            return calculateResult();
+                            /* copied before the coroutine is resumed: code resumed in the coroutine
+                               may destroy this very lambda (frees the trampoline node, unsubscribes
+                               or replaces the std::function holding the lambda) */
+                            auto calculateResultForCaller = calculateResult;
+                            self->EmplaceCoResult(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
+                            ResumeAndPropagateException(handle);
+                            return calculateResultForCaller();
                         }
                     )
                 ),
@@ -1905,10 +2049,13 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](CallbackArg arg){
-                        self->EmplaceCoResult(arg); //what will be returned to coroutine
-                        handle();
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        self->EmplaceCoResult(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
+                        ResumeAndPropagateException(handle);
+                        return resultForCaller;
                     }
                 )
             );
@@ -1930,9 +2077,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](CallbackArg arg){
-                        self->OnArgumentsArrived(arg);
-                        // storedResult is alive as long as capture exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        self->OnArgumentsArrived(std::forward<CallbackArg>(arg));
+                        return resultForCaller;
                     }
                 )
             );
@@ -1956,10 +2106,13 @@ namespace CoroFork_detail{
                             std::forward<Function>(resultGetter)
                         )
                     ](CallbackArg arg){
-                        self->EmplaceCoResult(arg); //what will be returned to coroutine
-                        handle();
-                        // calculateResult is alive as long capture exists
-                        return calculateResult();
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto calculateResultForCaller = calculateResult;
+                        self->EmplaceCoResult(std::forward<CallbackArg>(arg)); //what will be returned to coroutine
+                        ResumeAndPropagateException(handle);
+                        return calculateResultForCaller();
                     }
                 )
             );
@@ -2002,10 +2155,13 @@ namespace CoroFork_detail{
                                 std::forward<Value>(result)
                             )
                         ](CallbackArgs... args){
-                            self->EmplaceCoResult(args...); //what will be returned to coroutine
-                            handle();
-                            // storedResult is alive as long as capture copy exists
-                            return storedResult;
+                            /* copied before the coroutine is resumed: code resumed in the coroutine
+                               may destroy this very lambda (frees the trampoline node, unsubscribes
+                               or replaces the std::function holding the lambda) */
+                            auto resultForCaller = storedResult;
+                            self->EmplaceCoResult(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                            ResumeAndPropagateException(handle);
+                            return resultForCaller;
                         }
                     )
                 ),
@@ -2036,9 +2192,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](CallbackArgs... args){
-                        self->OnArgumentsArrived(args...); //what will be returned to coroutine
-                        // storedResult is alive as long as capture copy exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        self->OnArgumentsArrived(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                        return resultForCaller;
                     }
                 )
             );
@@ -2067,10 +2226,13 @@ namespace CoroFork_detail{
                                 std::forward<Function>(resultGetter)
                             )
                         ](CallbackArgs... args){
-                            self->EmplaceCoResult(args...); //what will be returned to coroutine
-                            handle();
-                            // calculateResult is alive as long as std::function copy exists
-                            return calculateResult();
+                            /* copied before the coroutine is resumed: code resumed in the coroutine
+                               may destroy this very lambda (frees the trampoline node, unsubscribes
+                               or replaces the std::function holding the lambda) */
+                            auto calculateResultForCaller = calculateResult;
+                            self->EmplaceCoResult(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                            ResumeAndPropagateException(handle);
+                            return calculateResultForCaller();
                         }
                     )
                 ),
@@ -2106,10 +2268,13 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](CallbackArgs... args){
-                        self->EmplaceCoResult(args...); //what will be returned to coroutine
-                        handle();
-                        // storedResult is alive as long as capture copy exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        self->EmplaceCoResult(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                        ResumeAndPropagateException(handle);
+                        return resultForCaller;
                     }
                 )
             );
@@ -2131,9 +2296,12 @@ namespace CoroFork_detail{
                             std::forward<Value>(result)
                         )
                     ](CallbackArgs... args){
-                        self->OnArgumentsArrived(args...); //what will be returned to coroutine
-                        // storedResult is alive as long as capture copy exists
-                        return storedResult;
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto resultForCaller = storedResult;
+                        self->OnArgumentsArrived(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                        return resultForCaller;
                     }
                 )
             );
@@ -2157,10 +2325,13 @@ namespace CoroFork_detail{
                             std::forward<Function>(resultGetter)
                         )
                     ](CallbackArgs... args){
-                        self->EmplaceCoResult(args...); //what will be returned to coroutine
-                        handle();
-                        // calculateResult is alive as long as std::function copy exists
-                        return calculateResult();
+                        /* copied before the coroutine is resumed: code resumed in the coroutine
+                           may destroy this very lambda (frees the trampoline node, unsubscribes
+                           or replaces the std::function holding the lambda) */
+                        auto calculateResultForCaller = calculateResult;
+                        self->EmplaceCoResult(std::forward<CallbackArgs>(args)...); //what will be returned to coroutine
+                        ResumeAndPropagateException(handle);
+                        return calculateResultForCaller();
                     }
                 )
             );
@@ -3041,9 +3212,13 @@ namespace CoroFork_detail{
     class ToPlainC{
         using KeepAlive = std::unique_ptr<void, void(*)(void*)>;
     public:
-        /// Return argument wrapped into "plain C" callback
+        /**Return argument wrapped into "plain C" callback.
+        Not noexcept on purpose: CallbackAllocator::Allocate throws
+        std::runtime_error once all maxCallbacksCount trampolines are in use,
+        the exception leaves await_suspend and is rethrown by the co_await
+        expression inside the coroutine */
         template<class WrappedCallback>
-        auto Decorate(WrappedCallback&& cb) noexcept{
+        auto Decorate(WrappedCallback&& cb){
             using Allocator = CallbackAllocator<
                 maxCallbacksCount,
                 AdditionalOptionalTag,
@@ -3205,7 +3380,7 @@ namespace CoroFork_detail{
 
             /// Called once result is available, but not under lock!
             void OnResultReady(){
-                handle.resume();
+                ResumeAndPropagateException(handle);
             }
         };
 
@@ -3383,7 +3558,7 @@ namespace CoroFork_detail{
 
             /// Called once callback was issued, but not under lock!
             void OnEventHappened(){
-                handle.resume();
+                ResumeAndPropagateException(handle);
             }
         };
 

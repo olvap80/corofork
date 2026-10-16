@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <functional>
 #include <future>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -305,4 +306,28 @@ COROFORK_TEST(subscription_delivers_from_another_thread){
     for( int i = 0; i < int(received.size()); ++i ){
         CHECK_EQ(received[std::size_t(i)], i);
     }
+}
+
+
+//______________________________________________________________________________
+// event arguments of move only types, both through the queue and directly
+
+COROFORK_TEST(subscription_argument_of_move_only_type){
+    std::function<void(std::unique_ptr<int>)> fire;
+    std::vector<int> received;
+
+    corofork(&){
+        auto subscription = invert_subscription(
+            [&](std::function<void(std::unique_ptr<int>)> cb){ fire = cb; }
+        );
+        fire(std::make_unique<int>(1)); //nobody awaits yet: goes through the queue
+        for( int eventIndex = 0; eventIndex < 2; ++eventIndex ){
+            std::unique_ptr<int> value = co_await subscription;
+            received.push_back(*value);
+        }
+        co_return;
+    };
+
+    fire(std::make_unique<int>(2)); //the coroutine awaits: handed over directly
+    CHECK((received == std::vector<int>{1, 2}));
 }

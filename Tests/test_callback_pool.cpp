@@ -11,6 +11,7 @@ To reuse the same pool twice a case wraps the lambda into a maker lambda.
 #include "test_framework.h"
 
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -251,6 +252,102 @@ COROFORK_TEST(invert_callback_returning_value){
 
     CHECK_EQ(stored(7), 99);
     CHECK_EQ(received, 7);
+}
+
+COROFORK_TEST(invert_callback_argument_of_move_only_type){
+    void (*stored)(std::unique_ptr<int>) = nullptr;
+    int received = 0;
+
+    corofork(&){
+        std::unique_ptr<int> value = co_await invert_callback<1>(
+            [&](void (*cb)(std::unique_ptr<int>)){ stored = cb; }
+        );
+        received = *value;
+        co_return;
+    };
+
+    stored(std::make_unique<int>(31));
+    CHECK_EQ(received, 31);
+}
+
+
+//______________________________________________________________________________
+// resuming frees the trampoline node (the awaiter dies at the end of the
+// co_await expression), so what goes back to the C API is taken before resuming
+
+COROFORK_TEST(invert_callback_returned_value_outlives_freed_trampoline){
+    using corofork_test::LifetimeTrackedValue;
+    LifetimeTrackedValue (*stored)(int) = nullptr;
+    int received = 0;
+
+    corofork(&){
+        received = co_await invert_callback<1>(
+            [&](LifetimeTrackedValue (*cb)(int)){ stored = cb; },
+            LifetimeTrackedValue(99)
+        );
+        co_return;
+    };
+
+    LifetimeTrackedValue::copiesFromDestroyedSource = 0;
+    LifetimeTrackedValue returned = stored(7);
+
+    CHECK_EQ(received, 7);
+    CHECK_EQ(returned.payload, 99);
+    CHECK_EQ(LifetimeTrackedValue::copiesFromDestroyedSource, 0);
+}
+
+COROFORK_TEST(invert_callback_result_of_call_outlives_freed_trampoline){
+    using corofork_test::LifetimeTrackedValue;
+    LifetimeTrackedValue (*stored)(int) = nullptr;
+    int received = 0;
+
+    corofork(&){
+        received = co_await invert_callback<1>(
+            [&](LifetimeTrackedValue (*cb)(int)){ stored = cb; },
+            [trackedPayload = LifetimeTrackedValue(55)]{ return trackedPayload; }
+        );
+        co_return;
+    };
+
+    LifetimeTrackedValue::copiesFromDestroyedSource = 0;
+    LifetimeTrackedValue returned = stored(8);
+
+    CHECK_EQ(received, 8);
+    CHECK_EQ(returned.payload, 55);
+    CHECK_EQ(LifetimeTrackedValue::copiesFromDestroyedSource, 0);
+}
+
+
+//______________________________________________________________________________
+// all trampolines of one invert_callback place in use: catchable exception
+
+COROFORK_TEST(invert_callback_exhausted_pool_throws_inside_coroutine){
+    void (*storedCallbacks[2])() = {nullptr, nullptr};
+    std::string errorMessages[2];
+
+    for( int coroutineIndex = 0; coroutineIndex < 2; ++coroutineIndex ){
+        //both coroutines come from one place, so both use one pool of 1 trampoline
+        corofork(&, coroutineIndex){
+            try{
+                co_await invert_callback<1>([&](void (*cb)()){
+                    storedCallbacks[coroutineIndex] = cb;
+                });
+            }
+            catch(const std::runtime_error& e){
+                errorMessages[coroutineIndex] = e.what();
+            }
+            co_return;
+        };
+    }
+
+    CHECK(storedCallbacks[0] != nullptr);
+    CHECK(storedCallbacks[1] == nullptr);
+    CHECK_EQ(errorMessages[0], std::string());
+    CHECK_EQ(errorMessages[1], std::string("callback_from_lambda cannot allocate trampoline"));
+
+    if( storedCallbacks[0] ){
+        storedCallbacks[0](); //finishes the first coroutine, frees the only trampoline
+    }
 }
 
 

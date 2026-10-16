@@ -42,18 +42,29 @@ set(COROFORK_TESTS
     test_invert_function
     test_invert_subscription
     test_callback_pool
+    test_coro_expected
 )
 
 find_package(Threads REQUIRED)
 
-foreach(corofork_test IN LISTS COROFORK_TESTS)
-    add_executable(${corofork_test} Tests/${corofork_test}.cpp)
-    target_include_directories(${corofork_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Tests)
-    target_link_libraries(${corofork_test} PRIVATE Threads::Threads)
+# One test executable: Tests/<source_name>.cpp built as <target_name>, registered in CTest
+function(add_corofork_test target_name source_name)
+    add_executable(${target_name} Tests/${source_name}.cpp)
+    target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Tests)
+    target_link_libraries(${target_name} PRIVATE Threads::Threads)
     if(MSVC)
-        target_compile_options(${corofork_test} PRIVATE /W4)
+        target_compile_options(${target_name} PRIVATE /W4)
     else()
-        target_compile_options(${corofork_test} PRIVATE -Wall -Wextra)
+        target_compile_options(${target_name} PRIVATE -Wall -Wextra)
     endif()
-    add_test(NAME ${corofork_test} COMMAND ${corofork_test})
+    add_test(NAME ${target_name} COMMAND ${target_name})
+endfunction()
+
+foreach(corofork_test IN LISTS COROFORK_TESTS)
+    add_corofork_test(${corofork_test} ${corofork_test})
 endforeach()
+
+# The same coro_expected tests once more as C++23: adds the std::expected cases
+# (compiled only with a standard library that provides <expected>)
+add_corofork_test(test_coro_expected_cpp23 test_coro_expected)
+set_target_properties(test_coro_expected_cpp23 PROPERTIES CXX_STANDARD 23)

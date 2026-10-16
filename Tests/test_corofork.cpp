@@ -7,6 +7,8 @@
 #include "corofork.h"
 #include "test_framework.h"
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <future>
 #include <memory>
@@ -207,4 +209,155 @@ COROFORK_TEST(corosync_propagates_exception_from_another_thread){
 
     worker.join();
     CHECK_EQ(message, std::string("thrown in another thread"));
+}
+
+namespace{
+    /**Awaitable of "another library": resumes the coroutine with plain
+    handle.resume() from a new thread, no corofork code is involved */
+    struct ResumesInNewThreadWithPlainResume{
+        std::thread& resumingThread;
+        bool& resumeReturnedNormally;
+
+        bool await_ready() const noexcept { return false; }
+
+        void await_suspend(std::coroutine_handle<> handle){
+            //read the references first, the coroutine may run in the new thread at once
+            std::thread& threadToStart = resumingThread;
+            bool& returnedNormally = resumeReturnedNormally;
+
+            threadToStart = std::thread([handle, &returnedNormally]{
+                try{
+                    handle.resume();
+                    returnedNormally = true;
+                }
+                catch(...){
+                    returnedNormally = false;
+                }
+            });
+        }
+
+        void await_resume() const noexcept {}
+    };
+}
+
+COROFORK_TEST(corosync_propagates_exception_when_resumed_by_foreign_awaitable){
+    /* The guarantee corofork does not give: whatever code resumes the corosync
+       body (here plain handle.resume() of another library in another thread),
+       the exception reaches the corosync caller, and resume() in that thread
+       returns normally */
+    std::thread resumingThread;
+    bool resumeReturnedNormally = false;
+    std::string message;
+
+    try{
+        corosync(&){
+            co_await ResumesInNewThreadWithPlainResume{resumingThread, resumeReturnedNormally};
+            throw std::runtime_error("thrown after plain resume in another thread");
+        };
+    }
+    catch(const std::runtime_error& e){
+        message = e.what();
+    }
+    if( resumingThread.joinable() ){
+        resumingThread.join();
+    }
+
+    CHECK_EQ(message, std::string("thrown after plain resume in another thread"));
+    CHECK_EQ(resumeReturnedNormally, true);
+}
+
+namespace{
+    /**Body local whose destructor watches for corosync returning to the caller.
+    The destructor waits (bounded) for corosyncReturned: a correct corosync
+    returns only after this destructor is done, so the wait always runs out,
+    and destructorSawCorosyncReturned stays false */
+    struct WatchesCorosyncReturn{
+        const std::atomic<bool>& corosyncReturned;
+        bool& destructorSawCorosyncReturned;
+
+        ~WatchesCorosyncReturn(){
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+            while( std::chrono::steady_clock::now() < deadline ){
+                if( corosyncReturned.load() ){
+                    destructorSawCorosyncReturned = true;
+                    return;
+                }
+                std::this_thread::yield();
+            }
+        }
+    };
+}
+
+COROFORK_TEST(corosync_returns_only_after_body_locals_are_destroyed){
+    /* The only case with a timeout: the wrong order (corosync returns while
+       the destructor of a body local still runs in another thread) can only be
+       observed by letting that destructor wait for the caller */
+    std::atomic<bool> corosyncReturned{false};
+    bool destructorSawCorosyncReturned = false;
+    std::thread worker;
+
+    corosync(&){
+        WatchesCorosyncReturn bodyLocal{corosyncReturned, destructorSawCorosyncReturned};
+        co_await invert_function([&](std::function<void()> resumer){
+            worker = std::thread(resumer); //the body finishes in the worker thread
+        });
+        co_return; //explicit co_return: return_void runs before ~WatchesCorosyncReturn
+    };
+    corosyncReturned = true;
+    worker.join();
+
+    CHECK_EQ(destructorSawCorosyncReturned, false);
+}
+
+
+//______________________________________________________________________________
+// corofork: exception escaping the body frees the frame and the captures
+
+COROFORK_TEST(corofork_exception_before_suspension_reaches_caller_and_frees_captures){
+    auto capturedOwner = std::make_shared<int>(1);
+    std::weak_ptr<int> capturedObserver = capturedOwner;
+    std::string message;
+
+    try{
+        corofork(capturedOwner){
+            if( *capturedOwner == 1 ){
+                throw std::runtime_error("thrown before the first suspension");
+            }
+            co_return;
+        };
+    }
+    catch(const std::runtime_error& e){
+        message = e.what();
+    }
+    capturedOwner.reset(); //from here only the copy captured by the coroutine may hold it
+
+    CHECK_EQ(message, std::string("thrown before the first suspension"));
+    CHECK(capturedObserver.expired());
+}
+
+COROFORK_TEST(corofork_exception_after_resume_reaches_callback_caller_and_frees_captures){
+    std::function<void()> stored;
+    auto capturedOwner = std::make_shared<int>(1);
+    std::weak_ptr<int> capturedObserver = capturedOwner;
+
+    corofork(&stored, capturedOwner){
+        co_await invert_function([&](std::function<void()> cb){ stored = cb; });
+        if( *capturedOwner == 1 ){
+            throw std::runtime_error("thrown after resume");
+        }
+    };
+    capturedOwner.reset();
+    CHECK(!capturedObserver.expired()); //the suspended coroutine still holds the capture
+
+    std::string message;
+    try{
+        stored(); //resumes the coroutine, the body throws
+    }
+    catch(const std::runtime_error& e){
+        message = e.what();
+    }
+
+    CHECK_EQ(message, std::string("thrown after resume"));
+    CHECK(capturedObserver.expired());
 }
