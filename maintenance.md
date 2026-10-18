@@ -200,17 +200,26 @@ In file order:
    Immediate completion goes through the setup lambda returning `std::optional` (or
    `bool` for `void()` callbacks): `ProcessSetupResult` stores the value and
    `await_suspend` returns `false`, so the coroutine continues without suspending.
-2. **`AwaitAsTemporaryOnly::operator co_await() &&` returns the awaitable by value.**
-   Measured for the three forms of the return type:
+2. **`AwaitAsTemporaryOnly::operator co_await() &&` returns by rvalue reference on
+   the measured compilers, by value elsewhere.** The macro
+   `COROFORK_AWAITER_BY_REFERENCE` selects the form: `1` returns `RealAwaitable&&`
+   (the awaiter is the member of the `AwaitAsTemporaryOnly` temporary, alive until the
+   end of the `co_await` full expression), `0` returns `RealAwaitable` (the awaitable is
+   moved into the coroutine frame). Default `1` for GCC 16 and later, Clang 22 and
+   later, MSVC 2019 (`_MSC_VER` 1929) and later, `0` for every other compiler.
+   `-DCOROFORK_AWAITER_BY_REFERENCE=0` or `=1` overrides the default. Measured for the
+   three forms of the return type (moves of the setup lambda per `co_await`):
 
    | Return type | GCC 12.2 | GCC 16.2 | Clang 22.1.8 | MSVC 2019 |
    | --- | --- | --- | --- | --- |
-   | `RealAwaitable` (current) | 2 moves of the setup lambda | 2 | 2 | 2 |
-   | `RealAwaitable&` (before commit `a636459`) | does not compile: GCC copies the awaiter, the copy constructor is deleted | compiles | compiles | not checked |
-   | `RealAwaitable&&` | compiles, still 2 moves | 1 | 1 | 1 |
+   | `RealAwaitable` (macro `0`) | 2, all tests pass | 2, all tests pass | 2, all tests pass | 2 |
+   | `RealAwaitable&&` (macro `1`) | 2, the two `*_setup_lambda_is_moved_not_copied` tests fail (they expect 1) | 1, all tests pass | 1, all tests pass | 1, all tests pass |
+   | `RealAwaitable&` (before commit `a636459`, not used) | does not compile: GCC copies the awaiter, the copy constructor is deleted | compiles | compiles | not checked |
 
-   The value form compiles everywhere and costs one move more than the `&&` form on
-   the newer compilers (see [Plans](#maintenance), item 1).
+   To add a compiler to the default list (GCC 13, 14, 15 are not measured yet): build
+   the tests with `-DCOROFORK_AWAITER_BY_REFERENCE=1`; when
+   `function_setup_lambda_is_moved_not_copied` and
+   `invert_callback_setup_lambda_is_moved_not_copied` pass, the compiler makes 1 move.
 3. **Generated callbacks copy what the callback returns before resuming.** Resuming
    may destroy the generated lambda itself: the `invert_callback` slot is freed at the
    end of the `co_await` full expression, the coroutine may replace the
@@ -258,11 +267,13 @@ In file order:
     left a reference to a destroyed lambda (GCC: crash, Clang `-O2`: silently
     "worked"). Measured cost per `co_await` with GCC 16.2, Clang 22.1.8 (`-O0`, `-O2`)
     and MSVC 2019 (`/O2`), for `invert_function` and `invert_callback`:
-    0 heap allocations, 0 copies, 2 moves of the setup lambda. The 2 moves:
+    0 heap allocations, 0 copies, 1 move of the setup lambda with
+    `COROFORK_AWAITER_BY_REFERENCE` `1` (the default on these three compilers), 2 moves
+    with `0` (the default elsewhere, measured with GCC 12.2 too). The moves:
     - into `setupLambda`, while `AwaitAsTemporaryOnly` constructs the awaitable in place
       (`std::in_place` constructor, no move of a ready awaitable),
-    - out of `AwaitAsTemporaryOnly::operator co_await() &&`, which returns the awaitable
-      by value (item 2) into the coroutine frame.
+    - only with `0`: out of `AwaitAsTemporaryOnly::operator co_await() &&`, which then
+      returns the awaitable by value into the coroutine frame (item 2).
 
     A move of a lambda moves the captures: no allocation for `std::string`,
     `std::unique_ptr`, `std::vector`. A setup lambda may capture move only values.
@@ -521,12 +532,10 @@ ctest --test-dir build --output-on-failure
 
 ### Maintenance
 
-1. **One move of the setup lambda per `co_await` instead of two**: return
-   `RealAwaitable&&` from `AwaitAsTemporaryOnly::operator co_await() &&` (see
-   [Design decisions](#design-decisions), items 2 and 11). Measured: GCC 16.2,
-   Clang 22.1.8 and MSVC 2019 make 1 move, GCC 12.2 compiles the form and still makes
-   2 moves. Measure GCC 13, 14 and 15 with the corofork tests first (needs a local
-   GCC 13 or later, Compiler Explorer got only the reproduction).
+1. **Extend the default list of `COROFORK_AWAITER_BY_REFERENCE`** with GCC 13, 14, 15
+   (and older Clang, MSVC 2022) after the check described in
+   [Design decisions](#design-decisions), item 2. Needs a local compiler: Compiler
+   Explorer got only the reproduction of the GCC 12 bug, never code of corofork.
 2. **Safe synchronous completion through the callback.** When the API calls the
    callback before the setup lambda returns, the generated callback sets an atomic flag
    instead of resuming nested, and `await_suspend` returns `false`. A callback arriving

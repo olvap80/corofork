@@ -210,6 +210,40 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
    Define COROFORK_SUPPRESS_GCC12_WARNING to silence the warning once the code
    follows the rules above. Details and the reproduction: maintenance.md,
    "GCC 12 destroys co_await temporaries twice" */
+/* COROFORK_AWAITER_BY_REFERENCE selects how AwaitAsTemporaryOnly hands the awaiter
+   of invert_function / invert_callback to co_await:
+       1: by rvalue reference, 1 move of the setup lambda per co_await,
+       0: by value, 2 moves of the setup lambda per co_await.
+   Default 1 only for the compilers where form 1 was measured (all tests pass,
+   1 move): GCC 16.2, Clang 22.1.8, MSVC 2019 (14.29). Every other compiler
+   gets 0. g++ 12.2 compiles form 1 too, but still makes 2 moves.
+   Define the macro as 0 or 1 to override, for example to check GCC 13 to 15:
+       -DCOROFORK_AWAITER_BY_REFERENCE=1 */
+#ifndef COROFORK_AWAITER_BY_REFERENCE
+#   if defined(__clang__)
+#       if __clang_major__ >= 22
+#           define COROFORK_AWAITER_BY_REFERENCE 1
+#       else
+#           define COROFORK_AWAITER_BY_REFERENCE 0
+#       endif
+#   elif defined(__GNUC__)
+#       if __GNUC__ >= 16
+#           define COROFORK_AWAITER_BY_REFERENCE 1
+#       else
+#           define COROFORK_AWAITER_BY_REFERENCE 0
+#       endif
+#   elif defined(_MSC_VER)
+#       if _MSC_VER >= 1929
+#           define COROFORK_AWAITER_BY_REFERENCE 1
+#       else
+#           define COROFORK_AWAITER_BY_REFERENCE 0
+#       endif
+#   else
+#       define COROFORK_AWAITER_BY_REFERENCE 0
+#   endif
+#endif
+
+
 #if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 12 \
     && !defined(COROFORK_SUPPRESS_GCC12_WARNING)
 #   pragma GCC warning "corofork: GCC 12 destroys a lambda written inside co_await twice. In a setup lambda written inside co_await capture by reference only ([&]); put captures by value into a named lambda passed as invert_function(std::move(setup)) or into a helper function returning invert_function(...). Or use GCC 13.1+. Then define COROFORK_SUPPRESS_GCC12_WARNING. See maintenance.md"
@@ -418,19 +452,25 @@ namespace CoroFork_detail{
         /**It is possible to issue co_await only on "full expression" in coroutine.
         Thus "saving/moving to some other location and awaiting later" is explicitly banned,
         to prevent referencing those components of the "full expression" that were destroyed.
-        NOTE: the awaiter is handed over BY VALUE (moved into the coroutine
-              frame) and not by reference on purpose: returning a reference
-              here makes GCC copy the awaiter into the frame, which fails
-              for the non copyable awaitables below.
-              Checked by a run: g++ 12.2 rejects `-> RealAwaitable&` with
-              "use of deleted function" (copy of the awaitable), and still
-              moves the awaitable for `-> RealAwaitable&&`; g++ 16.2 and
-              clang 22 accept both reference forms, MSVC 2019 accepts
-              `-> RealAwaitable&&` (the `&` form was not checked with MSVC)
-              (details in maintenance.md, "Design decisions", item 2) */
+        Two forms, selected by COROFORK_AWAITER_BY_REFERENCE (see its definition):
+          1: by rvalue reference, the awaiter is the member of this temporary
+             (this temporary lives until the end of the co_await full expression),
+             1 move of the setup lambda per co_await;
+          0: by value, the awaitable is moved into the coroutine frame,
+             2 moves of the setup lambda per co_await.
+        `-> RealAwaitable&` (lvalue reference, the form before commit a636459)
+        is not used: g++ 12.2 rejects that form with "use of deleted function"
+        (GCC copies the awaiter, the awaitables below are not copyable).
+        Details: maintenance.md, "Design decisions", item 2 */
+#   if COROFORK_AWAITER_BY_REFERENCE
+        auto operator co_await() && -> RealAwaitable&& {
+            return std::move(awaitable);
+        }
+#   else
         auto operator co_await() && -> RealAwaitable {
             return std::move(awaitable);
         }
+#   endif
 
         /// Intentionally prevent co_await on stored values
         std::suspend_always operator co_await() & = delete;

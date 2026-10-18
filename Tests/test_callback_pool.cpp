@@ -405,7 +405,7 @@ COROFORK_TEST(invert_callback_setup_lambda_is_moved_not_copied){
     };
 
     CHECK_EQ(CopyMoveCounter::copies, 0);
-    CHECK(CopyMoveCounter::moves <= 2); //same 2 moves as invert_function
+    CHECK(CopyMoveCounter::moves <= (COROFORK_AWAITER_BY_REFERENCE ? 1 : 2)); //same as invert_function
     stored();
 }
 

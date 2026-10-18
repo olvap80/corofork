@@ -362,11 +362,11 @@ COROFORK_TEST(function_setup_lambda_is_moved_not_copied){
         co_return;
     };
 
-    /* 2 moves: into the awaitable (constructed in place inside
-       AwaitAsTemporaryOnly), then out of AwaitAsTemporaryOnly::operator co_await
-       into the coroutine frame */
+    /* 1 move into the awaitable (constructed in place inside AwaitAsTemporaryOnly);
+       with COROFORK_AWAITER_BY_REFERENCE == 0 one more move out of
+       AwaitAsTemporaryOnly::operator co_await into the coroutine frame */
     CHECK_EQ(CopyMoveCounter::copies, 0);
-    CHECK(CopyMoveCounter::moves <= 2);
+    CHECK(CopyMoveCounter::moves <= (COROFORK_AWAITER_BY_REFERENCE ? 1 : 2));
     stored();
 }
 
